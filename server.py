@@ -240,29 +240,102 @@ KNOWN PROJECTS:
 
 
 # ---------------------------------------------------------------------------
-# Weather (wttr.in)
+# Weather
 # ---------------------------------------------------------------------------
+# Location is resolved from (in order): WEATHER_LATITUDE + WEATHER_LONGITUDE
+# env vars, a cached IP-geolocation lookup, or a fresh ipwho.is lookup.
+# Temperature unit defaults to Fahrenheit; override with WEATHER_UNIT=celsius.
 
 _cached_weather: Optional[str] = None
 _weather_fetched: bool = False
+_cached_weather_location: Optional[dict] = None
+_weather_location_fetched_at: float = 0.0
+_WEATHER_LOCATION_TTL_SECONDS = 60 * 15
 
 
-async def fetch_weather() -> str:
-    """Fetch current weather from wttr.in. Cached for the session."""
-    global _cached_weather, _weather_fetched
-    if _weather_fetched:
-        return _cached_weather or "Weather data unavailable."
-    _weather_fetched = True
+def _format_location_label(city: str, region: str, country: str) -> str:
+    parts = [p.strip() for p in (city, region) if p and p.strip()]
+    if parts:
+        return ", ".join(parts[:2])
+    return (country or "your area").strip() or "your area"
+
+
+def _get_weather_location() -> Optional[dict]:
+    """Resolve weather location: env override → cached lookup → fresh IP lookup."""
+    global _cached_weather_location, _weather_location_fetched_at
+
+    lat_raw = os.getenv("WEATHER_LATITUDE", "").strip()
+    lon_raw = os.getenv("WEATHER_LONGITUDE", "").strip()
+    label_override = os.getenv("WEATHER_LOCATION_LABEL", "").strip()
+    if lat_raw and lon_raw:
+        try:
+            return {
+                "latitude": float(lat_raw),
+                "longitude": float(lon_raw),
+                "label": label_override or "your area",
+            }
+        except ValueError:
+            log.warning("Invalid WEATHER_LATITUDE / WEATHER_LONGITUDE in environment")
+
+    if (
+        _cached_weather_location is not None
+        and (time.time() - _weather_location_fetched_at) < _WEATHER_LOCATION_TTL_SECONDS
+    ):
+        return _cached_weather_location
+
     try:
-        async with httpx.AsyncClient(timeout=5.0) as http:
-            resp = await http.get("https://wttr.in/?format=%l:+%C,+%t", headers={"User-Agent": "curl"})
-            if resp.status_code == 200:
-                _cached_weather = resp.text.strip()
-                return _cached_weather
+        import urllib.request as _ureq
+        with _ureq.urlopen(
+            "https://ipwho.is/?fields=success,city,region,country,latitude,longitude",
+            timeout=3,
+        ) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("success") is True:
+            location = {
+                "latitude": float(data["latitude"]),
+                "longitude": float(data["longitude"]),
+                "label": label_override or _format_location_label(
+                    str(data.get("city", "")),
+                    str(data.get("region", "")),
+                    str(data.get("country", "")),
+                ),
+            }
+            _cached_weather_location = location
+            _weather_location_fetched_at = time.time()
+            return location
     except Exception as e:
-        log.warning(f"Weather fetch failed: {e}")
-    _cached_weather = None
-    return "Weather data unavailable."
+        log.debug(f"IP-geolocation lookup failed: {e}")
+
+    return _cached_weather_location
+
+
+def _fetch_weather_string_sync() -> Optional[str]:
+    """Sync weather fetch — safe to call from a threaded worker."""
+    location = _get_weather_location()
+    if not location:
+        return None
+
+    unit = os.getenv("WEATHER_UNIT", "fahrenheit").strip().lower()
+    if unit not in ("fahrenheit", "celsius"):
+        unit = "fahrenheit"
+    unit_symbol = "°F" if unit == "fahrenheit" else "°C"
+
+    try:
+        import urllib.request as _ureq
+        url = (
+            "https://api.open-meteo.com/v1/forecast"
+            f"?latitude={location['latitude']}&longitude={location['longitude']}"
+            f"&current=temperature_2m,weathercode&temperature_unit={unit}"
+        )
+        with _ureq.urlopen(url, timeout=3) as resp:
+            current = json.loads(resp.read()).get("current", {})
+        temp = current.get("temperature_2m")
+        if temp is None:
+            return None
+        return f"Current weather in {location['label']}: {temp}{unit_symbol}"
+    except Exception as e:
+        log.debug(f"Weather fetch failed: {e}")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1322,16 +1395,11 @@ return windowList
             except Exception as e:
                 log.debug(f"Context thread error: {e}")
 
-            # Weather — refresh every loop (30s is fine, API is fast)
-            try:
-                import urllib.request, json as _json
-                url = "https://api.open-meteo.com/v1/forecast?latitude=27.77&longitude=-82.64&current=temperature_2m,weathercode&temperature_unit=fahrenheit"
-                with urllib.request.urlopen(url, timeout=3) as resp:
-                    d = _json.loads(resp.read()).get("current", {})
-                    temp = d.get("temperature_2m", "?")
-                    _ctx_cache["weather"] = f"Current weather in St. Petersburg, FL: {temp}°F"
-            except Exception:
-                pass
+            # Weather — refresh every loop (30s is fine, API is fast).
+            # Location resolves from env override → cached lookup → IP geolocation.
+            weather_string = _fetch_weather_string_sync()
+            if weather_string:
+                _ctx_cache["weather"] = weather_string
 
             time.sleep(30)
 
