@@ -9,8 +9,11 @@ import asyncio
 import logging
 import os
 import re
+import shutil
+import sys
 import time
 from pathlib import Path
+from shlex import quote as shell_quote
 from urllib.parse import quote
 
 log = logging.getLogger("jarvis.actions")
@@ -19,12 +22,17 @@ DESKTOP_PATH = Path.home() / "Desktop"
 
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
+_IS_DARWIN = sys.platform == "darwin"
+_HAS_DISPLAY = bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
+
 
 async def _mark_terminal_as_jarvis(revert_after: float = 5.0):
     """Temporarily set the front Terminal window to Ocean theme, then revert.
 
     Shows the user JARVIS is active in that terminal. Reverts after revert_after seconds.
     """
+    if not _IS_DARWIN:
+        return
     # Save the current profile, switch to Ocean, then revert
     script_save = (
         'tell application "Terminal"\n'
@@ -65,6 +73,8 @@ async def _mark_terminal_as_jarvis(revert_after: float = 5.0):
 
 async def _revert_terminal_theme(profile_name: str):
     """Revert a Terminal window back to its original profile."""
+    if not _IS_DARWIN:
+        return
     escaped = profile_name.replace('"', '\\"')
     script = (
         'tell application "Terminal"\n'
@@ -89,6 +99,57 @@ def applescript_escape(s: str) -> str:
 
 async def open_terminal(command: str = "") -> dict:
     """Open Terminal.app and optionally run a command. Marks it blue for JARVIS."""
+    if not _IS_DARWIN:
+        if not _HAS_DISPLAY:
+            if command:
+                try:
+                    await asyncio.create_subprocess_shell(
+                        command,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    return {"success": True, "confirmation": "Executed that command, sir."}
+                except Exception:
+                    return {"success": False, "confirmation": "I couldn't run that command here, sir."}
+            return {"success": False, "confirmation": "No desktop session detected, sir."}
+
+        terminal = None
+        for candidate in ("konsole", "x-terminal-emulator", "gnome-terminal", "kitty", "alacritty", "xterm"):
+            if shutil.which(candidate):
+                terminal = candidate
+                break
+
+        if not terminal:
+            return {"success": False, "confirmation": "No terminal emulator found, sir."}
+
+        try:
+            if terminal == "konsole":
+                cmd = [terminal]
+                if command:
+                    cmd += ["-e", "bash", "-lc", command]
+            elif terminal == "gnome-terminal":
+                cmd = [terminal]
+                if command:
+                    cmd += ["--", "bash", "-lc", command]
+            elif terminal in ("kitty", "alacritty", "xterm", "x-terminal-emulator"):
+                cmd = [terminal]
+                if command:
+                    cmd += ["-e", "bash", "-lc", command]
+            else:
+                cmd = [terminal]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return {
+                "success": True,
+                "confirmation": "Terminal is open, sir." if proc.pid else "I had trouble opening a terminal, sir.",
+            }
+        except Exception:
+            return {"success": False, "confirmation": "I had trouble opening a terminal, sir."}
+
     if command:
         escaped = applescript_escape(command)
         script = (
@@ -122,6 +183,37 @@ async def open_terminal(command: str = "") -> dict:
 
 async def open_browser(url: str, browser: str = "chrome") -> dict:
     """Open URL in user's browser (Chrome or Firefox)."""
+    if not _IS_DARWIN:
+        if not _HAS_DISPLAY:
+            return {"success": False, "confirmation": "No desktop session detected, sir."}
+        try:
+            opener = shutil.which("xdg-open")
+            if opener:
+                proc = await asyncio.create_subprocess_exec(
+                    opener, url,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                return {"success": True, "confirmation": "Pulled that up in your browser, sir." if proc.pid else "Browser ran into a problem, sir."}
+
+            binary = None
+            if browser.lower() == "firefox":
+                binary = shutil.which("firefox")
+            else:
+                binary = shutil.which("google-chrome") or shutil.which("chromium") or shutil.which("chromium-browser")
+
+            if not binary:
+                return {"success": False, "confirmation": "No browser binary found, sir."}
+
+            proc = await asyncio.create_subprocess_exec(
+                binary, url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return {"success": True, "confirmation": "Pulled that up, sir." if proc.pid else "Browser ran into a problem, sir."}
+        except Exception:
+            return {"success": False, "confirmation": "Browser ran into a problem, sir."}
+
     escaped_url = url.replace('"', '\\"')
 
     if browser.lower() == "firefox":
@@ -171,6 +263,14 @@ async def open_claude_in_project(project_dir: str, prompt: str) -> dict:
     claude_md = Path(project_dir) / "CLAUDE.md"
     claude_md.write_text(f"# Task\n\n{prompt}\n\nBuild this completely. If web app, make index.html work standalone.\n")
 
+    if not _IS_DARWIN:
+        if not shutil.which("claude"):
+            return {"success": False, "confirmation": "Claude Code CLI isn't installed, sir."}
+
+        skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
+        command = f"cd {shell_quote(project_dir)} && claude{skip_flag}"
+        return await open_terminal(command)
+
     skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
     escaped_dir = applescript_escape(project_dir)
     script = (
@@ -204,6 +304,8 @@ async def prompt_existing_terminal(project_name: str, prompt: str) -> dict:
     Uses System Events keystroke to type into an active Claude Code session
     rather than `do script` which would open a new shell.
     """
+    if not _IS_DARWIN:
+        return {"success": False, "confirmation": "That terminal control is only available on macOS, sir."}
     escaped_name = applescript_escape(project_name)
     escaped_prompt = applescript_escape(prompt)
 
@@ -284,6 +386,8 @@ return "OK"
 
 async def get_chrome_tab_info() -> dict:
     """Read the current Chrome tab's title and URL via AppleScript."""
+    if not _IS_DARWIN:
+        return {}
     script = (
         'tell application "Google Chrome"\n'
         "    set tabTitle to title of active tab of front window\n"

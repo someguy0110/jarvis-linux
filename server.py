@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -69,6 +70,25 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
 DESKTOP_PATH = Path.home() / "Desktop"
+
+ACTION_KEYWORDS = {
+    "browse": [
+        "browse",
+        "search for",
+        "look up",
+        "google",
+        "find me",
+        "pull up",
+        "open chrome",
+        "open firefox",
+        "open browser",
+        "go to",
+        "in the browser",
+    ],
+    "open_terminal": ["open terminal", "terminal", "claude code", "run claude"],
+    "build": ["build", "create", "make"],
+    "research": ["research", "deep research"],
+}
 
 JARVIS_SYSTEM_PROMPT = """\
 You are JARVIS — Just A Rather Very Intelligent System. You serve as {user_name}'s AI assistant, modeled precisely after Tony Stark's AI from the MCU films.
@@ -465,23 +485,47 @@ class ClaudeTaskManager:
         prompt_file = Path(work_dir) / ".jarvis_prompt.md"
         prompt_file.write_text(task.prompt)
 
-        # Open Terminal.app with claude running in the project directory
-        skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
-        escaped_work_dir = applescript_escape(work_dir)
-        applescript = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "cd {escaped_work_dir} && cat .jarvis_prompt.md | claude -p{skip_flag} | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
-        end tell
-        '''
+        if not shutil.which("claude"):
+            task.status = "failed"
+            task.error = "Claude Code CLI (claude) not found in PATH."
+            task.completed_at = datetime.now()
+            await self._notify({
+                "type": "task_complete",
+                "task_id": task.id,
+                "status": task.status,
+                "summary": task.error,
+            })
+            return
 
-        process = await asyncio.create_subprocess_exec(
-            "osascript", "-e", applescript,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        from shlex import quote as shell_quote
+
+        skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
+        cmd = (
+            f"cd {shell_quote(work_dir)} && "
+            f"cat .jarvis_prompt.md | claude -p{skip_flag} | tee .jarvis_output.txt; "
+            "printf '\\n--- JARVIS TASK COMPLETE ---\\n' >> .jarvis_output.txt"
         )
-        await process.communicate()
-        task.pid = process.pid
+
+        result = await open_terminal(cmd)
+        if not result.get("success"):
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                task.pid = proc.pid
+            except Exception as e:
+                task.status = "failed"
+                task.error = f"Failed to start task: {e}"
+                task.completed_at = datetime.now()
+                await self._notify({
+                    "type": "task_complete",
+                    "task_id": task.id,
+                    "status": task.status,
+                    "summary": task.error,
+                })
+                return
 
         # Monitor the output file for completion
         output_file = Path(work_dir) / ".jarvis_output.txt"
@@ -1349,9 +1393,10 @@ def _refresh_context_sync():
         while True:
             try:
                 # Screen — fast
-                try:
-                    proc = __import__("subprocess").run(
-                        ["osascript", "-e", '''
+                if sys.platform == "darwin" and shutil.which("osascript"):
+                    try:
+                        proc = __import__("subprocess").run(
+                            ["osascript", "-e", '''
 set windowList to ""
 tell application "System Events"
     set frontApp to name of first application process whose frontmost is true
@@ -1375,22 +1420,22 @@ tell application "System Events"
 end tell
 return windowList
 '''],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if proc.returncode == 0 and proc.stdout.strip():
-                        windows = []
-                        for line in proc.stdout.strip().split("\n"):
-                            parts = line.strip().split("|||")
-                            if len(parts) >= 3:
-                                windows.append({
-                                    "app": parts[0].strip(),
-                                    "title": parts[1].strip(),
-                                    "frontmost": parts[2].strip().lower() == "true",
-                                })
-                        if windows:
-                            _ctx_cache["screen"] = format_windows_for_context(windows)
-                except Exception:
-                    pass
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            windows = []
+                            for line in proc.stdout.strip().split("\n"):
+                                parts = line.strip().split("|||")
+                                if len(parts) >= 3:
+                                    windows.append({
+                                        "app": parts[0].strip(),
+                                        "title": parts[1].strip(),
+                                        "frontmost": parts[2].strip().lower() == "true",
+                                    })
+                            if windows:
+                                _ctx_cache["screen"] = format_windows_for_context(windows)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 log.debug(f"Context thread error: {e}")
@@ -1835,9 +1880,7 @@ async def handle_browse(text: str, target: str) -> str:
 
     # 3. Fall back to Google search with cleaned query
     query = target
-    for prefix in ["search for", "look up", "google", "find me", "pull up", "open chrome",
-                    "open firefox", "open browser", "go to", "can you", "in the browser",
-                    "can you go to", "please"]:
+    for prefix in ACTION_KEYWORDS["browse"] + ["can you", "can you go to", "please"]:
         query = query.lower().replace(prefix, "").strip()
     # Remove filler words
     query = re.sub(r'\b(can|you|the|in|to|a|an|for|me|my|please)\b', '', query).strip()

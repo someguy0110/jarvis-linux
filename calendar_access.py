@@ -8,11 +8,24 @@ filter dates in Python. Results cached and refreshed in background.
 import asyncio
 import logging
 import os
+import sys
 import time as _time
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import urljoin
 
 log = logging.getLogger("jarvis.calendar")
+
+# macOS: Apple Calendar via AppleScript
+# Linux: CalDAV via HTTP (optional)
+_IS_DARWIN = sys.platform == "darwin"
+
+# CalDAV config (Linux/Windows)
+_caldav_urls_env = os.getenv("CALDAV_CALENDAR_URLS", "").strip()
+CALDAV_CALENDAR_URLS: list[str] = [u.strip() for u in _caldav_urls_env.split(",") if u.strip()]
+CALDAV_URL = os.getenv("CALDAV_URL", "").strip()
+CALDAV_USERNAME = os.getenv("CALDAV_USERNAME", "").strip()
+CALDAV_PASSWORD = os.getenv("CALDAV_PASSWORD", "").strip()
 
 # Calendars to scan — set CALENDAR_ACCOUNTS env var to a comma-separated list,
 # or leave empty to auto-discover ALL calendars from Apple Calendar.
@@ -47,6 +60,8 @@ end tell
 async def _ensure_calendar_running():
     """Launch Calendar.app if not already running."""
     global _calendar_launched
+    if not _IS_DARWIN:
+        return
     if _calendar_launched:
         return
     try:
@@ -142,6 +157,16 @@ def _parse_applescript_date(s: str) -> datetime | None:
 async def refresh_cache():
     """Refresh the event cache. Called from background loop."""
     global _event_cache, _cache_time, USER_CALENDARS, _auto_discovered
+    if not _IS_DARWIN:
+        start = _time.time()
+        events = await _fetch_caldav_events_for_today()
+        events.sort(key=lambda e: (not e["all_day"], e.get("start_dt") or datetime.max))
+        _event_cache = events
+        _cache_time = _time.time()
+        elapsed = _time.time() - start
+        log.info(f"Calendar cache refreshed: {len(events)} events today ({elapsed:.1f}s)")
+        return
+
     await _ensure_calendar_running()
 
     # Auto-discover calendars if none configured
@@ -208,6 +233,10 @@ async def get_next_event() -> dict | None:
 
 async def get_calendar_names() -> list[str]:
     """Get list of all calendar names."""
+    if not _IS_DARWIN:
+        discovered = await _discover_caldav_calendars()
+        return [c["name"] for c in discovered]
+
     await _ensure_calendar_running()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -222,6 +251,164 @@ async def get_calendar_names() -> list[str]:
     except Exception:
         pass
     return []
+
+
+def _caldav_configured() -> bool:
+    if not CALDAV_USERNAME or not CALDAV_PASSWORD:
+        return False
+    return bool(CALDAV_CALENDAR_URLS or CALDAV_URL)
+
+
+async def _discover_caldav_calendars() -> list[dict]:
+    if not _caldav_configured():
+        return []
+
+    if CALDAV_CALENDAR_URLS:
+        return [{"name": url.rstrip("/").split("/")[-1] or "Calendar", "url": url} for url in CALDAV_CALENDAR_URLS]
+
+    import httpx
+    from xml.etree import ElementTree as ET
+
+    headers = {
+        "Depth": "1",
+        "Content-Type": "application/xml; charset=utf-8",
+    }
+    body = """<?xml version="1.0" encoding="utf-8" ?>
+<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/">
+  <d:prop>
+    <d:displayname />
+    <d:resourcetype />
+  </d:prop>
+</d:propfind>"""
+
+    try:
+        async with httpx.AsyncClient(auth=httpx.BasicAuth(CALDAV_USERNAME, CALDAV_PASSWORD), timeout=10.0) as client:
+            resp = await client.request("PROPFIND", CALDAV_URL, headers=headers, content=body)
+            if resp.status_code not in (207, 200):
+                return []
+
+        root = ET.fromstring(resp.text)
+        ns = {
+            "d": "DAV:",
+            "c": "urn:ietf:params:xml:ns:caldav",
+        }
+
+        calendars: list[dict] = []
+        for r in root.findall(".//d:response", ns):
+            href = r.findtext("d:href", default="", namespaces=ns).strip()
+            display = r.findtext(".//d:displayname", default="", namespaces=ns).strip()
+            resourcetype = r.find(".//d:resourcetype", ns)
+            if resourcetype is None:
+                continue
+            if resourcetype.find("c:calendar", ns) is None:
+                continue
+            url = urljoin(CALDAV_URL, href)
+            name = display or url.rstrip("/").split("/")[-1] or "Calendar"
+            calendars.append({"name": name, "url": url})
+
+        return calendars
+    except Exception:
+        return []
+
+
+async def _fetch_caldav_events_for_today() -> list[dict]:
+    if not _caldav_configured():
+        return []
+
+    import httpx
+    from datetime import timezone
+    from icalendar import Calendar
+    from xml.etree import ElementTree as ET
+
+    calendars = await _discover_caldav_calendars()
+    if not calendars:
+        return []
+
+    now_local = datetime.now().astimezone()
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    end_local = start_local + timedelta(days=1)
+    start_utc = start_local.astimezone(timezone.utc)
+    end_utc = end_local.astimezone(timezone.utc)
+
+    start_str = start_utc.strftime("%Y%m%dT%H%M%SZ")
+    end_str = end_utc.strftime("%Y%m%dT%H%M%SZ")
+
+    headers = {
+        "Depth": "1",
+        "Content-Type": "application/xml; charset=utf-8",
+    }
+    report = f"""<?xml version="1.0" encoding="utf-8" ?>
+<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:prop>
+    <d:getetag />
+    <c:calendar-data />
+  </d:prop>
+  <c:filter>
+    <c:comp-filter name="VCALENDAR">
+      <c:comp-filter name="VEVENT">
+        <c:time-range start="{start_str}" end="{end_str}" />
+      </c:comp-filter>
+    </c:comp-filter>
+  </c:filter>
+</c:calendar-query>"""
+
+    events: list[dict] = []
+    ns = {
+        "d": "DAV:",
+        "c": "urn:ietf:params:xml:ns:caldav",
+    }
+
+    async with httpx.AsyncClient(auth=httpx.BasicAuth(CALDAV_USERNAME, CALDAV_PASSWORD), timeout=20.0) as client:
+        for cal in calendars:
+            try:
+                resp = await client.request("REPORT", cal["url"], headers=headers, content=report)
+                if resp.status_code not in (207, 200):
+                    continue
+
+                root = ET.fromstring(resp.text)
+                for cd in root.findall(".//c:calendar-data", ns):
+                    ical = (cd.text or "").strip()
+                    if not ical:
+                        continue
+                    try:
+                        parsed = Calendar.from_ical(ical)
+                    except Exception:
+                        continue
+
+                    for component in parsed.walk():
+                        if component.name != "VEVENT":
+                            continue
+                        summary = str(component.get("SUMMARY") or "").strip()
+                        dtstart = component.get("DTSTART")
+                        if not dtstart:
+                            continue
+                        dt_val = dtstart.dt
+
+                        all_day = not hasattr(dt_val, "hour")
+                        if all_day:
+                            start_dt = datetime(dt_val.year, dt_val.month, dt_val.day, tzinfo=now_local.tzinfo)
+                            time_str = "ALL_DAY"
+                        else:
+                            start_dt = dt_val
+                            if start_dt.tzinfo is None:
+                                start_dt = start_dt.replace(tzinfo=now_local.tzinfo)
+                            start_dt = start_dt.astimezone(now_local.tzinfo)
+                            time_str = start_dt.strftime("%-I:%M %p")
+
+                        if start_dt.date() != now_local.date():
+                            continue
+
+                        events.append({
+                            "calendar": cal["name"],
+                            "title": summary or "(No title)",
+                            "start": time_str,
+                            "start_dt": start_dt,
+                            "all_day": all_day,
+                        })
+            except Exception:
+                continue
+
+    return events
 
 
 def format_events_for_context(events: list[dict]) -> str:

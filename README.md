@@ -29,7 +29,7 @@ JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, 
 
 ## Requirements
 
-- **macOS** (uses AppleScript for Calendar, Mail, Notes integration)
+- **macOS** (native AppleScript integrations), or **Linux** (CalDAV + IMAP + filesystem notes)
 - **Python 3.11+**
 - **Node.js 18+**
 - **Google Chrome** (required for Web Speech API)
@@ -76,7 +76,7 @@ python server.py
 cd frontend && npm run dev
 
 # 8. Open Chrome
-open http://localhost:5173
+xdg-open http://localhost:5173  # Linux (or just paste into your browser)
 ```
 
 Click the page once to enable audio, then speak. JARVIS will respond.
@@ -108,8 +108,8 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
                                         (spawns real dev work)
                                                 |
                                                 v
-                                        AppleScript Bridge
-                                        (Calendar, Mail, Notes, Terminal)
+                                        System Integrations
+                                        (macOS: AppleScript, Linux: CalDAV/IMAP/notes folder)
 ```
 
 | Layer | Technology |
@@ -120,7 +120,7 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 | AI (fast) | Claude Haiku -- low-latency voice responses |
 | AI (deep) | Claude Opus -- research and complex tasks |
 | TTS | Fish Audio with JARVIS voice model |
-| System | AppleScript for all macOS integrations |
+| System | macOS: AppleScript. Linux: CalDAV (calendar) + IMAP (mail) + filesystem notes. |
 
 ## How the Voice Loop Works
 

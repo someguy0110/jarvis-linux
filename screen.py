@@ -10,10 +10,16 @@ import asyncio
 import base64
 import json
 import logging
+import os
+import shutil
+import sys
 import tempfile
 from pathlib import Path
 
 log = logging.getLogger("jarvis.screen")
+
+_IS_DARWIN = sys.platform == "darwin"
+_HAS_DISPLAY = bool(os.getenv("DISPLAY") or os.getenv("WAYLAND_DISPLAY"))
 
 
 async def get_active_windows() -> list[dict]:
@@ -22,6 +28,9 @@ async def get_active_windows() -> list[dict]:
     Uses AppleScript + System Events to enumerate windows.
     Returns list of {"app": str, "title": str, "frontmost": bool}.
     """
+    if not _IS_DARWIN:
+        return await _get_active_windows_linux()
+
     # Use a simpler approach that's more permission-friendly
     script = """
 set windowList to ""
@@ -80,6 +89,17 @@ return windowList
 
 async def get_running_apps() -> list[str]:
     """Get list of running application names (visible only)."""
+    if not _IS_DARWIN:
+        windows = await get_active_windows()
+        apps = []
+        seen = set()
+        for w in windows:
+            app = w.get("app")
+            if app and app not in seen:
+                apps.append(app)
+                seen.add(app)
+        return apps
+
     script = """
 tell application "System Events"
     set appNames to name of every application process whose visible is true
@@ -114,6 +134,9 @@ async def take_screenshot(display_only: bool = True) -> str | None:
     Returns:
         Base64-encoded PNG string, or None on failure.
     """
+    if not _IS_DARWIN:
+        return await _take_screenshot_linux()
+
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
         tmp_path = f.name
 
@@ -143,6 +166,111 @@ async def take_screenshot(display_only: bool = True) -> str | None:
         return None
     except Exception as e:
         log.warning(f"Screenshot error: {e}")
+        return None
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def _get_active_windows_linux() -> list[dict]:
+    if not _HAS_DISPLAY:
+        return []
+
+    wmctrl = shutil.which("wmctrl")
+    if not wmctrl:
+        return []
+
+    def _read_comm(pid: int) -> str:
+        try:
+            return Path(f"/proc/{pid}/comm").read_text().strip()
+        except Exception:
+            return ""
+
+    active_id = ""
+    if shutil.which("xdotool"):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "xdotool", "getactivewindow",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=2)
+            if proc.returncode == 0:
+                dec_id = out.decode().strip()
+                if dec_id.isdigit():
+                    active_id = hex(int(dec_id))
+        except Exception:
+            active_id = ""
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            wmctrl, "-lp",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=3)
+        if proc.returncode != 0:
+            return []
+
+        windows: list[dict] = []
+        for line in stdout.decode(errors="ignore").splitlines():
+            parts = line.split(None, 4)
+            if len(parts) < 5:
+                continue
+            win_id, _, pid_str, _, title = parts
+            try:
+                pid = int(pid_str)
+            except ValueError:
+                pid = 0
+            app = _read_comm(pid) if pid else ""
+            windows.append({
+                "app": app or "Unknown",
+                "title": title.strip(),
+                "frontmost": bool(active_id and win_id.lower() == active_id.lower()),
+            })
+        return windows
+    except Exception:
+        return []
+
+
+async def _take_screenshot_linux() -> str | None:
+    if not _HAS_DISPLAY:
+        return None
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp_path = f.name
+
+    try:
+        cmd: list[str] | None = None
+        if shutil.which("spectacle"):
+            cmd = ["spectacle", "-b", "-n", "-o", tmp_path]
+        elif shutil.which("gnome-screenshot"):
+            cmd = ["gnome-screenshot", "-f", tmp_path]
+        elif shutil.which("grim"):
+            cmd = ["grim", tmp_path]
+        elif shutil.which("import"):
+            cmd = ["import", "-window", "root", tmp_path]
+        elif shutil.which("scrot"):
+            cmd = ["scrot", tmp_path]
+
+        if not cmd:
+            return None
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=15)
+
+        if proc.returncode != 0 or not Path(tmp_path).exists():
+            return None
+
+        data = Path(tmp_path).read_bytes()
+        return base64.b64encode(data).decode()
+    except Exception:
         return None
     finally:
         try:

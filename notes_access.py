@@ -7,12 +7,42 @@ CANNOT edit or delete existing notes (safety).
 
 import asyncio
 import logging
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
 
 log = logging.getLogger("jarvis.notes")
+
+_IS_DARWIN = sys.platform == "darwin"
+
+
+def _notes_root() -> Path:
+    raw = os.getenv("NOTES_DIR", "").strip()
+    root = Path(raw).expanduser() if raw else (Path.home() / "jarvis-notes")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _iter_note_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for p in root.rglob("*"):
+        if p.is_file() and p.suffix.lower() in (".md", ".txt"):
+            files.append(p)
+    return files
+
+
+def _slugify_filename(s: str) -> str:
+    s = s.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s or "note"
 
 
 async def _run_notes_script(script: str, timeout: float = 10) -> str:
     """Run an AppleScript against Notes.app."""
+    if not _IS_DARWIN:
+        return ""
     try:
         proc = await asyncio.create_subprocess_exec(
             "osascript", "-e", script,
@@ -34,6 +64,17 @@ async def _run_notes_script(script: str, timeout: float = 10) -> str:
 
 async def get_recent_notes(count: int = 10) -> list[dict]:
     """Get most recent notes (title + creation date)."""
+    if not _IS_DARWIN:
+        root = _notes_root()
+        files = _iter_note_files(root)
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        out: list[dict] = []
+        for p in files[:count]:
+            ts = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
+            folder = str(p.parent.relative_to(root)) if p.parent != root else "Notes"
+            out.append({"title": p.stem, "date": ts, "folder": folder})
+        return out
+
     script = f'''
 tell application "Notes"
     set output to ""
@@ -67,6 +108,17 @@ end tell
 
 async def read_note(title_match: str) -> dict | None:
     """Read a note by title (partial match). Returns title + body."""
+    if not _IS_DARWIN:
+        root = _notes_root()
+        query = title_match.strip().lower()
+        for p in _iter_note_files(root):
+            if query and query in p.stem.lower():
+                body = p.read_text(errors="ignore")
+                if len(body) > 3000:
+                    body = body[:3000]
+                return {"title": p.stem, "body": body.strip()}
+        return None
+
     escaped = title_match.replace('"', '\\"')
     script = f'''
 tell application "Notes"
@@ -94,6 +146,21 @@ end tell
 
 async def search_notes_apple(query: str, count: int = 5) -> list[dict]:
     """Search notes by title keyword."""
+    if not _IS_DARWIN:
+        root = _notes_root()
+        q = query.strip().lower()
+        matches: list[dict] = []
+        for p in _iter_note_files(root):
+            if len(matches) >= count:
+                break
+            try:
+                if q in p.stem.lower() or q in p.read_text(errors="ignore").lower():
+                    ts = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds")
+                    matches.append({"title": p.stem, "date": ts})
+            except Exception:
+                continue
+        return matches
+
     escaped = query.replace('"', '\\"')
     script = f'''
 tell application "Notes"
@@ -126,6 +193,28 @@ async def create_apple_note(title: str, body: str, folder: str = "Notes") -> boo
 
     Supports checklist items: lines starting with "- [ ]" or "- [x]" become checkboxes.
     """
+    if not _IS_DARWIN:
+        root = _notes_root()
+        folder_name = folder.strip() or "Notes"
+        folder_path = root / folder_name
+        folder_path.mkdir(parents=True, exist_ok=True)
+
+        stem = _slugify_filename(title)[:80]
+        path = folder_path / f"{stem}.md"
+        if path.exists():
+            suffix = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = folder_path / f"{stem}-{suffix}.md"
+
+        try:
+            content = body if body.endswith("\n") else (body + "\n")
+            if title.strip():
+                content = f"# {title.strip()}\n\n{content}"
+            path.write_text(content)
+            log.info(f"Created note file: {path}")
+            return True
+        except Exception:
+            return False
+
     # Convert markdown-style checklists to HTML
     html_body = _body_to_html(body)
 
@@ -187,6 +276,14 @@ def _body_to_html(body: str) -> str:
 
 async def get_note_folders() -> list[str]:
     """Get list of note folder names."""
+    if not _IS_DARWIN:
+        root = _notes_root()
+        folders = ["Notes"]
+        for p in sorted(root.iterdir()):
+            if p.is_dir() and not p.name.startswith("."):
+                folders.append(p.name)
+        return folders
+
     script = '''
 tell application "Notes"
     set output to ""
