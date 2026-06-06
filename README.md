@@ -72,6 +72,9 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 # 6. Start the backend (Terminal 1)
 python server.py
 
+# On first run, the server generates JARVIS_AUTH_TOKEN and writes it into .env.
+# Paste that token into the Settings panel (Access Token) so the UI can connect.
+
 # 7. Start the frontend (Terminal 2)
 cd frontend && npm run dev
 

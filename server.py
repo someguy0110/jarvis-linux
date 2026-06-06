@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import os
+import secrets
 import shutil
 import sys
 import time
@@ -35,7 +36,7 @@ from typing import Optional
 
 import anthropic
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -70,6 +71,86 @@ PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
 DESKTOP_PATH = Path.home() / "Desktop"
+
+def _ensure_auth_token_env() -> str:
+    token = os.getenv("JARVIS_AUTH_TOKEN", "").strip()
+    if token:
+        return token
+
+    token = secrets.token_urlsafe(32)
+    env_path = Path(__file__).parent / ".env"
+    try:
+        if env_path.exists():
+            lines = env_path.read_text().splitlines()
+        else:
+            lines = []
+        updated = False
+        out_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                k, _, _ = stripped.partition("=")
+                if k.strip() == "JARVIS_AUTH_TOKEN":
+                    out_lines.append(f"JARVIS_AUTH_TOKEN={token}")
+                    updated = True
+                    continue
+            out_lines.append(line)
+        if not updated:
+            if out_lines and out_lines[-1].strip() != "":
+                out_lines.append("")
+            out_lines.append(f"JARVIS_AUTH_TOKEN={token}")
+        env_path.write_text("\n".join(out_lines) + "\n")
+        try:
+            os.chmod(env_path, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    os.environ["JARVIS_AUTH_TOKEN"] = token
+    return token
+
+
+JARVIS_AUTH_TOKEN = _ensure_auth_token_env()
+JARVIS_DEV_MODE = os.getenv("JARVIS_DEV_MODE", "").lower() in ("1", "true", "yes", "on")
+
+_origins_env = os.getenv("JARVIS_ALLOWED_ORIGINS", "").strip()
+JARVIS_ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()] if _origins_env else [
+    "http://localhost:5173",
+    "https://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://127.0.0.1:5173",
+    "http://localhost:8340",
+    "https://localhost:8340",
+    "http://127.0.0.1:8340",
+    "https://127.0.0.1:8340",
+]
+
+_projects_env = os.getenv("JARVIS_PROJECTS_DIR", "").strip()
+JARVIS_PROJECTS_DIR = Path(_projects_env).expanduser() if _projects_env else (Path.home() / "JarvisProjects")
+try:
+    JARVIS_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
+def _extract_token_from_headers(headers) -> str:
+    auth = headers.get("authorization", "") if headers else ""
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return (headers.get("x-jarvis-token", "") if headers else "").strip()
+
+
+def _is_authorized_http(request: Request) -> bool:
+    token = _extract_token_from_headers(request.headers)
+    if not token:
+        token = request.cookies.get("jarvis_token", "").strip()
+    return bool(token and secrets.compare_digest(token, JARVIS_AUTH_TOKEN))
+
+
+def _is_authorized_ws(ws: WebSocket) -> bool:
+    token = (ws.query_params.get("token") or "").strip()
+    return bool(token and secrets.compare_digest(token, JARVIS_AUTH_TOKEN))
 
 ACTION_KEYWORDS = {
     "browse": [
@@ -475,11 +556,13 @@ class ClaudeTaskManager:
         # Create project directory if it doesn't exist
         work_dir = task.working_dir
         if work_dir == "." or not work_dir:
-            # Create a new project folder on Desktop
             project_name = self._generate_project_name(task.prompt)
-            work_dir = str(Path.home() / "Desktop" / project_name)
+            work_dir = str(JARVIS_PROJECTS_DIR / project_name)
             os.makedirs(work_dir, exist_ok=True)
             task.working_dir = work_dir
+        else:
+            task.working_dir = _sanitize_working_dir(work_dir)
+            work_dir = task.working_dir
 
         # Write the prompt to a temp file so we can pipe it to claude
         prompt_file = Path(work_dir) / ".jarvis_prompt.md"
@@ -1473,11 +1556,39 @@ app = FastAPI(title="JARVIS Server", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=JARVIS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api") and request.url.path != "/api/health":
+        if not _is_authorized_http(request):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        if request.url.path in ("/api/restart", "/api/fix-self") and not JARVIS_DEV_MODE:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+    return await call_next(request)
+
+
+def _sanitize_working_dir(working_dir: str) -> str:
+    raw = (working_dir or "").strip()
+    base = JARVIS_PROJECTS_DIR.resolve()
+    if not raw or raw == ".":
+        return str(base)
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception:
+        raise ValueError("Invalid working_dir")
+    if resolved == base:
+        return str(resolved)
+    try:
+        if resolved.is_relative_to(base):
+            return str(resolved)
+    except Exception:
+        pass
+    raise ValueError("working_dir must be inside JARVIS_PROJECTS_DIR")
 
 
 # -- REST Endpoints --------------------------------------------------------
@@ -1529,10 +1640,13 @@ async def api_get_task(task_id: str):
 @app.post("/api/tasks")
 async def api_create_task(req: TaskRequest):
     try:
-        task_id = await task_manager.spawn(req.prompt, req.working_dir)
+        safe_dir = _sanitize_working_dir(req.working_dir)
+        task_id = await task_manager.spawn(req.prompt, safe_dir)
         return {"task_id": task_id, "status": "spawned"}
     except RuntimeError as e:
         return JSONResponse(status_code=429, content={"error": str(e)})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 
 @app.delete("/api/tasks/{task_id}")
@@ -1647,7 +1761,7 @@ async def handle_open_terminal() -> str:
 
 async def handle_build(target: str) -> str:
     name = _generate_project_name(target)
-    path = str(Path.home() / "Desktop" / name)
+    path = str(JARVIS_PROJECTS_DIR / name)
     os.makedirs(path, exist_ok=True)
 
     # Write CLAUDE.md with clear instructions
@@ -1659,19 +1773,10 @@ async def handle_build(target: str) -> str:
     prompt_file = Path(path) / ".jarvis_prompt.txt"
     prompt_file.write_text(target)
 
+    from shlex import quote as shell_quote
     skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
-    escaped_path = applescript_escape(path)
-    script = (
-        'tell application "Terminal"\n'
-        "    activate\n"
-        f'    do script "cd {escaped_path} && cat .jarvis_prompt.txt | claude -p{skip_flag}"\n'
-        "end tell"
-    )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    cmd = f"cd {shell_quote(path)} && cat .jarvis_prompt.txt | claude -p{skip_flag}"
+    await open_terminal(cmd)
 
     recently_built.append({"name": name, "path": path, "time": time.time()})
     return f"On it, sir. Claude Code is working in {name}."
@@ -1696,11 +1801,8 @@ async def handle_show_recent() -> str:
         await open_browser(f"file://{html_files[0]}")
         return f"Opened {html_files[0].name} from {last['name']}, sir."
 
-    # Fall back to opening the folder in Finder
-    escaped_last_path = applescript_escape(last["path"])
-    script = f'tell application "Finder"\nactivate\nopen POSIX file "{escaped_last_path}"\nend tell'
-    await asyncio.create_subprocess_exec("osascript", "-e", script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    return f"Opened the {last['name']} folder in Finder, sir."
+    await open_browser(f"file://{last['path']}")
+    return f"Opened the {last['name']} folder, sir."
 
 
 # ---------------------------------------------------------------------------
@@ -1926,7 +2028,7 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
 <p style="color:#555;font-size:0.8em">Researched by JARVIS using Claude Opus &bull; {datetime.now().strftime('%B %d, %Y %I:%M %p')}</p>
 </body></html>"""
 
-        results_file = Path.home() / "Desktop" / ".jarvis_research.html"
+        results_file = JARVIS_PROJECTS_DIR / ".jarvis_research.html"
         results_file.write_text(html_content)
 
         browser_name = "firefox" if "firefox" in text.lower() else "chrome"
@@ -1993,6 +2095,10 @@ async def voice_handler(ws: WebSocket):
         {"type": "task_spawned", "task_id": "...", "prompt": "..."}
         {"type": "task_complete", "task_id": "...", "summary": "..."}
     """
+    if not _is_authorized_ws(ws):
+        await ws.close(code=1008)
+        return
+
     await ws.accept()
     task_manager.register_websocket(ws)
     history: list[dict] = []
@@ -2063,6 +2169,9 @@ async def voice_handler(ws: WebSocket):
 
             # ── Fix-self: activate work mode in JARVIS repo ──
             if msg.get("type") == "fix_self":
+                if not JARVIS_DEV_MODE:
+                    await ws.send_json({"type": "text", "text": "That feature is disabled, sir."})
+                    continue
                 jarvis_dir = str(Path(__file__).parent)
                 await work_session.start(jarvis_dir)
                 response_text = "Work mode active in my own repo, sir. Tell me what needs fixing."
@@ -2549,8 +2658,8 @@ async def api_test_anthropic(body: KeyTest):
         client = anthropic.AsyncAnthropic(api_key=key)
         await client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=10, messages=[{"role": "user", "content": "Hi"}])
         return {"valid": True}
-    except Exception as e:
-        return {"valid": False, "error": str(e)[:200]}
+    except Exception:
+        return {"valid": False, "error": "Test failed"}
 
 @app.post("/api/settings/test-fish")
 async def api_test_fish(body: KeyTest):
@@ -2570,8 +2679,8 @@ async def api_test_fish(body: KeyTest):
                 return {"valid": False, "error": "Invalid API key"}
             else:
                 return {"valid": False, "error": f"HTTP {resp.status_code}"}
-    except Exception as e:
-        return {"valid": False, "error": str(e)[:200]}
+    except Exception:
+        return {"valid": False, "error": "Test failed"}
 
 @app.get("/api/settings/status")
 async def api_settings_status():
@@ -2633,7 +2742,11 @@ async def api_restart():
     log.info("Restart requested — shutting down in 2 seconds")
     async def _restart():
         await asyncio.sleep(2)
-        cmd = [sys.executable, __file__, "--port", "8340", "--host", "0.0.0.0"]
+        cmd = [sys.executable, __file__, "--port", "8340", "--host", "127.0.0.1"]
+        cert_file = Path(__file__).parent / "cert.pem"
+        key_file = Path(__file__).parent / "key.pem"
+        if cert_file.exists() and key_file.exists():
+            cmd.append("--ssl")
         os.execv(sys.executable, cmd)
     asyncio.create_task(_restart())
     return {"status": "restarting"}
@@ -2643,21 +2756,9 @@ async def api_restart():
 async def api_fix_self():
     """Enter work mode in the JARVIS repo — JARVIS can now fix himself."""
     jarvis_dir = str(Path(__file__).parent)
-    # The work_session is per-WebSocket, so we set a flag that the handler picks up
-    # For now, also open Terminal so user can see
     skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
-    escaped_jarvis_dir = applescript_escape(jarvis_dir)
-    script = (
-        'tell application "Terminal"\n'
-        '    activate\n'
-        f'    do script "cd {escaped_jarvis_dir} && claude{skip_flag}"\n'
-        'end tell'
-    )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    from shlex import quote as shell_quote
+    await open_terminal(f"cd {shell_quote(jarvis_dir)} && claude{skip_flag}")
     log.info("Work mode: JARVIS repo opened for self-improvement")
     return {"status": "work_mode_active", "path": jarvis_dir}
 
@@ -2688,7 +2789,7 @@ if __name__ == "__main__":
     import uvicorn
 
     parser = argparse.ArgumentParser(description="JARVIS Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=8340, help="Bind port")
     parser.add_argument("--reload", action="store_true", help="Auto-reload on changes")
     parser.add_argument("--ssl", action="store_true", help="Enable HTTPS with key.pem/cert.pem")

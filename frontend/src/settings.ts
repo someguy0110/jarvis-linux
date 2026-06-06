@@ -41,19 +41,36 @@ let isOpen = false;
 let isFirstTimeSetup = false;
 let setupStep = 0; // 0=anthropic, 1=fish, 2=name, 3=done
 
+const AUTH_TOKEN_KEY = "jarvis_auth_token";
+
+function getAuthToken(): string {
+  try {
+    return localStorage.getItem(AUTH_TOKEN_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // API helpers
 // ---------------------------------------------------------------------------
 
 async function apiGet<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const token = getAuthToken();
+  const res = await fetch(url, {
+    headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  });
   return res.json();
 }
 
 async function apiPost<T>(url: string, body: unknown): Promise<T> {
+  const token = getAuthToken();
   const res = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
     body: JSON.stringify(body),
   });
   return res.json();
@@ -81,6 +98,14 @@ function buildPanelHTML(): string {
         <!-- API Keys -->
         <section class="settings-section" id="section-api-keys">
           <h3>API Keys</h3>
+
+          <div class="settings-field">
+            <label>Access Token</label>
+            <div class="settings-input-row">
+              <input type="password" id="input-auth-token" placeholder="JARVIS_AUTH_TOKEN from .env" />
+              <button class="settings-btn" id="btn-save-auth-token">Save</button>
+            </div>
+          </div>
 
           <div class="settings-field">
             <label>Anthropic API Key</label>
@@ -269,6 +294,16 @@ function wireEvents() {
     await loadStatus();
   });
 
+  document.getElementById("btn-save-auth-token")?.addEventListener("click", async () => {
+    const tokenEl = document.getElementById("input-auth-token") as HTMLInputElement | null;
+    const token = tokenEl?.value.trim() || "";
+    try {
+      localStorage.setItem(AUTH_TOKEN_KEY, token);
+    } catch {}
+    await loadStatus();
+    await loadPreferences();
+  });
+
   // Save voice ID
   document.getElementById("btn-save-voice-id")?.addEventListener("click", async () => {
     const voiceId = (document.getElementById("input-fish-voice-id") as HTMLInputElement).value.trim();
@@ -396,6 +431,8 @@ export async function openSettings() {
   });
 
   // Load data
+  const tokenEl = document.getElementById("input-auth-token") as HTMLInputElement | null;
+  if (tokenEl) tokenEl.value = getAuthToken();
   const status = await loadStatus();
   await loadPreferences();
 
