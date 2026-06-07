@@ -2,9 +2,11 @@
 
 **Just A Rather Very Intelligent System.**
 
-A voice-first AI assistant that runs on your Mac. Talk to it, and it talks back -- with a British accent, dry wit, and an audio-reactive particle orb straight out of the MCU.
+A voice-first AI assistant that runs on Linux. Talk to it, and it talks back -- with a British accent, dry wit, and an audio-reactive particle orb straight out of the MCU.
 
-JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, spawn Claude Code sessions to build entire projects, and plan your day -- all through natural voice conversation.
+This project was originally built for macOS and has been converted to a Linux-first version. Calendar, mail, and notes are now powered by CalDAV, IMAP, and a local notes folder.
+
+JARVIS can browse the web, spawn Claude Code sessions to build entire projects, and plan your day -- all through natural voice conversation.
 
 > "Will do, sir."
 
@@ -29,7 +31,7 @@ JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, 
 
 ## Requirements
 
-- **macOS** (native AppleScript integrations), or **Linux** (CalDAV + IMAP + filesystem notes)
+- **Linux** (CalDAV + IMAP + filesystem notes)
 - **Python 3.11+**
 - **Node.js 18+**
 - **Google Chrome** (required for Web Speech API)
@@ -112,7 +114,7 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
                                                 |
                                                 v
                                         System Integrations
-                                        (macOS: AppleScript, Linux: CalDAV/IMAP/notes folder)
+                                        (CalDAV/IMAP/notes folder)
 ```
 
 | Layer | Technology |
@@ -123,7 +125,7 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 | AI (fast) | Claude Haiku -- low-latency voice responses |
 | AI (deep) | Claude Opus -- research and complex tasks |
 | TTS | Fish Audio with JARVIS voice model |
-| System | macOS: AppleScript. Linux: CalDAV (calendar) + IMAP (mail) + filesystem notes. |
+| System | CalDAV (calendar) + IMAP (mail) + filesystem notes |
 
 ## How the Voice Loop Works
 
@@ -147,9 +149,9 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 | `frontend/src/voice.ts` | Web Speech API + audio playback |
 | `frontend/src/main.ts` | Frontend state machine |
 | `memory.py` | SQLite memory system with FTS5 full-text search |
-| `calendar_access.py` | Apple Calendar integration via AppleScript |
-| `mail_access.py` | Apple Mail integration (read-only) |
-| `notes_access.py` | Apple Notes integration |
+| `calendar_access.py` | Calendar integration (CalDAV) |
+| `mail_access.py` | Mail integration (IMAP, read-only) |
+| `notes_access.py` | Notes integration (filesystem) |
 | `actions.py` | System actions (Terminal, Chrome, Claude Code) |
 | `browser.py` | Playwright web automation |
 | `work_mode.py` | Persistent Claude Code sessions |
@@ -170,13 +172,12 @@ JARVIS uses action tags to trigger real system actions:
 JARVIS remembers things you tell it using SQLite with FTS5 full-text search. Preferences, decisions, and facts persist across sessions.
 
 ### Calendar & Mail
-All macOS integrations use AppleScript -- no OAuth flows, no token management. Just native system access. Mail is intentionally read-only for safety.
+Calendar uses CalDAV and mail uses IMAP. Mail is intentionally read-only for safety.
 
 ## Contributing
 
 Contributions are welcome. Some areas that could use work:
 
-- **Linux/Windows support** -- replace AppleScript with cross-platform alternatives
 - **Alternative TTS engines** -- add ElevenLabs, OpenAI TTS, or local models
 - **Alternative LLMs** -- add OpenAI, Gemini, or local model support
 - **Mobile client** -- a companion app for voice interaction on the go
