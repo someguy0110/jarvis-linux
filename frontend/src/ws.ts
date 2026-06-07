@@ -18,10 +18,22 @@ export function createSocket(url: string): JarvisSocket {
   let closed = false;
   let connected = false;
 
+  function withAuthToken(rawUrl: string): string {
+    try {
+      const token = localStorage.getItem("jarvis_auth_token") || "";
+      if (!token) return rawUrl;
+      const u = new URL(rawUrl, window.location.href);
+      u.searchParams.set("token", token);
+      return u.toString();
+    } catch {
+      return rawUrl;
+    }
+  }
+
   function connect() {
     if (closed) return;
 
-    ws = new WebSocket(url);
+    ws = new WebSocket(withAuthToken(url));
 
     ws.onopen = () => {
       connected = true;

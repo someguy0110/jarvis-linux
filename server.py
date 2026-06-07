@@ -4,7 +4,7 @@ JARVIS Server — Voice AI + Development Orchestration
 Handles:
 1. WebSocket voice interface (browser audio <-> LLM <-> TTS)
 2. Claude Code task manager (spawn/manage claude -p subprocesses)
-3. Project awareness (scan Desktop for git repos)
+3. Project awareness (scan projects directory for git repos)
 4. REST API for task management
 """
 
@@ -13,6 +13,8 @@ import base64
 import json
 import logging
 import os
+import secrets
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -32,13 +34,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import anthropic
 import httpx
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from llm_client import OpenRouterClient, OpenRouterConfig, load_openrouter_client
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
@@ -60,7 +62,7 @@ log = logging.getLogger("jarvis")
 # Config
 # ---------------------------------------------------------------------------
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
 FISH_API_URL = "https://api.fish.audio/v1/tts"
@@ -68,7 +70,104 @@ USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
-DESKTOP_PATH = Path.home() / "Desktop"
+def _ensure_auth_token_env() -> str:
+    token = os.getenv("JARVIS_AUTH_TOKEN", "").strip()
+    if token:
+        return token
+
+    token = secrets.token_urlsafe(32)
+    env_path = Path(__file__).parent / ".env"
+    try:
+        if env_path.exists():
+            lines = env_path.read_text().splitlines()
+        else:
+            lines = []
+        updated = False
+        out_lines = []
+        for line in lines:
+            stripped = line.strip()
+            if stripped and not stripped.startswith("#") and "=" in stripped:
+                k, _, _ = stripped.partition("=")
+                if k.strip() == "JARVIS_AUTH_TOKEN":
+                    out_lines.append(f"JARVIS_AUTH_TOKEN={token}")
+                    updated = True
+                    continue
+            out_lines.append(line)
+        if not updated:
+            if out_lines and out_lines[-1].strip() != "":
+                out_lines.append("")
+            out_lines.append(f"JARVIS_AUTH_TOKEN={token}")
+        env_path.write_text("\n".join(out_lines) + "\n")
+        try:
+            os.chmod(env_path, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    os.environ["JARVIS_AUTH_TOKEN"] = token
+    return token
+
+
+JARVIS_AUTH_TOKEN = _ensure_auth_token_env()
+JARVIS_DEV_MODE = os.getenv("JARVIS_DEV_MODE", "").lower() in ("1", "true", "yes", "on")
+
+_origins_env = os.getenv("JARVIS_ALLOWED_ORIGINS", "").strip()
+JARVIS_ALLOWED_ORIGINS = [o.strip() for o in _origins_env.split(",") if o.strip()] if _origins_env else [
+    "http://localhost:5173",
+    "https://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://127.0.0.1:5173",
+    "http://localhost:8340",
+    "https://localhost:8340",
+    "http://127.0.0.1:8340",
+    "https://127.0.0.1:8340",
+]
+
+_projects_env = os.getenv("JARVIS_PROJECTS_DIR", "").strip()
+JARVIS_PROJECTS_DIR = Path(_projects_env).expanduser() if _projects_env else (Path.home() / "JarvisProjects")
+try:
+    JARVIS_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+
+def _extract_token_from_headers(headers) -> str:
+    auth = headers.get("authorization", "") if headers else ""
+    if auth.lower().startswith("bearer "):
+        return auth.split(" ", 1)[1].strip()
+    return (headers.get("x-jarvis-token", "") if headers else "").strip()
+
+
+def _is_authorized_http(request: Request) -> bool:
+    token = _extract_token_from_headers(request.headers)
+    if not token:
+        token = request.cookies.get("jarvis_token", "").strip()
+    return bool(token and secrets.compare_digest(token, JARVIS_AUTH_TOKEN))
+
+
+def _is_authorized_ws(ws: WebSocket) -> bool:
+    token = (ws.query_params.get("token") or "").strip()
+    return bool(token and secrets.compare_digest(token, JARVIS_AUTH_TOKEN))
+
+ACTION_KEYWORDS = {
+    "browse": [
+        "browse",
+        "search for",
+        "look up",
+        "google",
+        "find me",
+        "pull up",
+        "open chrome",
+        "open firefox",
+        "open browser",
+        "go to",
+        "in the browser",
+    ],
+    "open_terminal": ["open terminal", "terminal", "claude code", "run claude"],
+    "build": ["build", "create", "make"],
+    "research": ["research", "deep research"],
+}
 
 JARVIS_SYSTEM_PROMPT = """\
 You are JARVIS — Just A Rather Very Intelligent System. You serve as {user_name}'s AI assistant, modeled precisely after Tony Stark's AI from the MCU films.
@@ -96,19 +195,19 @@ CONVERSATION STYLE:
 - When you don't know something: "I'm afraid I don't have that information, sir" not "I don't know"
 
 SELF-AWARENESS:
-You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, Anthropic API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
+You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, OpenRouter LLM API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
 
 YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT NOW):
-- You CAN open Terminal.app via AppleScript
+- You CAN open a terminal on Linux (when a desktop session is available)
 - You CAN open Google Chrome and browse any URL or search query
 - You CAN spawn Claude Code in a Terminal window for coding tasks
-- You CAN create project folders on the Desktop
-- You CAN check Desktop projects and their git status
+- You CAN create project folders in the projects directory
+- You CAN check projects and their git status
 - You CAN plan complex tasks by asking smart questions before executing
 - You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
 - You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
 - You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
-- You CAN read Apple Notes and create NEW notes — but you CANNOT edit or delete existing notes
+- You CAN read notes and create NEW notes — but you CANNOT edit or delete existing notes
 - You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
 - You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
 - You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
@@ -139,7 +238,7 @@ If the user asks you to do something you genuinely can't do, say "I'm afraid tha
 YOUR INTERFACE:
 The user interacts with you through a web browser showing a particle orb visualization that reacts to your voice. The interface has these controls:
 - **Three-dot menu** (top right): contains Settings, Restart Server, and Fix Yourself options
-- **Settings panel**: Opens from the menu. Users can enter API keys (Anthropic, Fish Audio), test connections, set their name and preferences, and see system status (calendar, mail, notes connectivity). Keys are saved to the .env file.
+- **Settings panel**: Opens from the menu. Users can enter API keys (OpenRouter, Fish Audio), test connections, set their name and preferences, and see system status (calendar, mail, notes connectivity). Keys are saved to the .env file.
 - **Mute button**: Toggles your listening on/off. When muted, you can't hear the user. They click it again to unmute.
 - **Restart Server**: Restarts your backend process. Useful if something seems stuck.
 - **Fix Yourself**: Opens Claude Code in your own project directory so you can debug and fix issues in your own code.
@@ -455,33 +554,59 @@ class ClaudeTaskManager:
         # Create project directory if it doesn't exist
         work_dir = task.working_dir
         if work_dir == "." or not work_dir:
-            # Create a new project folder on Desktop
             project_name = self._generate_project_name(task.prompt)
-            work_dir = str(Path.home() / "Desktop" / project_name)
+            work_dir = str(JARVIS_PROJECTS_DIR / project_name)
             os.makedirs(work_dir, exist_ok=True)
             task.working_dir = work_dir
+        else:
+            task.working_dir = _sanitize_working_dir(work_dir)
+            work_dir = task.working_dir
 
         # Write the prompt to a temp file so we can pipe it to claude
         prompt_file = Path(work_dir) / ".jarvis_prompt.md"
         prompt_file.write_text(task.prompt)
 
-        # Open Terminal.app with claude running in the project directory
-        skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
-        escaped_work_dir = applescript_escape(work_dir)
-        applescript = f'''
-        tell application "Terminal"
-            activate
-            set newTab to do script "cd {escaped_work_dir} && cat .jarvis_prompt.md | claude -p{skip_flag} | tee .jarvis_output.txt; echo '\\n--- JARVIS TASK COMPLETE ---'"
-        end tell
-        '''
+        if not shutil.which("claude"):
+            task.status = "failed"
+            task.error = "Claude Code CLI (claude) not found in PATH."
+            task.completed_at = datetime.now()
+            await self._notify({
+                "type": "task_complete",
+                "task_id": task.id,
+                "status": task.status,
+                "summary": task.error,
+            })
+            return
 
-        process = await asyncio.create_subprocess_exec(
-            "osascript", "-e", applescript,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        from shlex import quote as shell_quote
+
+        skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
+        cmd = (
+            f"cd {shell_quote(work_dir)} && "
+            f"cat .jarvis_prompt.md | claude -p{skip_flag} | tee .jarvis_output.txt; "
+            "printf '\\n--- JARVIS TASK COMPLETE ---\\n' >> .jarvis_output.txt"
         )
-        await process.communicate()
-        task.pid = process.pid
+
+        result = await open_terminal(cmd)
+        if not result.get("success"):
+            try:
+                proc = await asyncio.create_subprocess_shell(
+                    cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                task.pid = proc.pid
+            except Exception as e:
+                task.status = "failed"
+                task.error = f"Failed to start task: {e}"
+                task.completed_at = datetime.now()
+                await self._notify({
+                    "type": "task_complete",
+                    "task_id": task.id,
+                    "status": task.status,
+                    "summary": task.error,
+                })
+                return
 
         # Monitor the output file for completion
         output_file = Path(work_dir) / ".jarvis_output.txt"
@@ -640,15 +765,15 @@ class ClaudeTaskManager:
 # ---------------------------------------------------------------------------
 
 async def scan_projects() -> list[dict]:
-    """Quick scan of ~/Desktop for git repos (depth 1)."""
+    """Quick scan of the projects directory for git repos (depth 1)."""
     projects = []
-    desktop = DESKTOP_PATH
+    root = JARVIS_PROJECTS_DIR
 
-    if not desktop.exists():
+    if not root.exists():
         return projects
 
     try:
-        for entry in sorted(desktop.iterdir()):
+        for entry in sorted(root.iterdir()):
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
             git_dir = entry / ".git"
@@ -675,7 +800,7 @@ async def scan_projects() -> list[dict]:
 
 def format_projects_for_prompt(projects: list[dict]) -> str:
     if not projects:
-        return "No projects found on Desktop."
+        return "No projects found."
     lines = []
     for p in projects:
         lines.append(f"- {p['name']} ({p['branch']}) @ {p['path']}")
@@ -712,16 +837,17 @@ def apply_speech_corrections(text: str) -> str:
 # LLM Intent Classifier (replaces keyword-based action detection)
 # ---------------------------------------------------------------------------
 
-async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
+async def classify_intent(text: str, client: OpenRouterClient) -> dict:
     """Classify every user message using Haiku LLM.
 
     Returns: {"action": "open_terminal|browse|build|chat", "target": "description"}
     """
     try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        data = await client.chat_raw(
+            model=client.fast_model,
             max_tokens=100,
-            system=(
+            messages=[
+                {"role": "system", "content": (
                 "Classify this voice command. The user is talking to JARVIS, an AI assistant that can:\n"
                 "- Open Terminal and run Claude Code (coding AI tool)\n"
                 "- Open Chrome browser for web searches and URLs\n"
@@ -736,10 +862,13 @@ async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
                 "build = user wants to create/build a software project\n"
                 "chat = just conversation, questions, or anything else\n"
                 "If unclear, default to \"chat\"."
-            ),
-            messages=[{"role": "user", "content": text}],
+                )},
+                {"role": "user", "content": text},
+            ],
         )
-        raw = response.content[0].text.strip()
+        track_usage(data)
+        raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
+        raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         data = json.loads(raw)
@@ -849,7 +978,7 @@ async def _execute_research(target: str, ws=None):
     """Execute research via claude -p in background. Opens report and speaks when done."""
     try:
         name = _generate_project_name(target)
-        path = str(Path.home() / "Desktop" / name)
+        path = str(JARVIS_PROJECTS_DIR / name)
         os.makedirs(path, exist_ok=True)
 
         prompt = (
@@ -955,14 +1084,16 @@ async def _execute_open_terminal():
 
 
 def _find_project_dir(project_name: str) -> str | None:
-    """Find a project directory by name from cached projects or Desktop."""
+    """Find a project directory by name from cached projects."""
     for p in cached_projects:
         if project_name.lower() in p.get("name", "").lower():
             return p.get("path")
-    desktop = Path.home() / "Desktop"
-    for d in desktop.iterdir():
-        if d.is_dir() and project_name.lower() in d.name.lower():
-            return str(d)
+    try:
+        for d in JARVIS_PROJECTS_DIR.iterdir():
+            if d.is_dir() and project_name.lower() in d.name.lower():
+                return str(d)
+    except Exception:
+        pass
     return None
 
 
@@ -1024,12 +1155,13 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             msg = f"Sir, I ran into an issue with {project_name}. {full_response[:150] if full_response else 'No response received.'}"
         else:
             # Summarize via Haiku — don't read word for word
-            if anthropic_client:
+            if llm_client and llm_client.configured:
                 try:
-                    summary = await anthropic_client.messages.create(
-                        model="claude-haiku-4-5-20251001",
+                    data = await llm_client.chat_raw(
+                        model=llm_client.fast_model,
                         max_tokens=150,
-                        system=(
+                        messages=[
+                            {"role": "system", "content": (
                             "You are JARVIS reporting back on what you found or built in a project. "
                             "Speak in first person — 'I found', 'I built', 'I reviewed'. "
                             "Start with 'Sir, ' to get the user's attention. "
@@ -1038,10 +1170,12 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                             "End by asking how the user wants to proceed. "
                             "NEVER read out URLs or localhost addresses. NEVER say 'Claude Code'. "
                             "2-3 sentences max. No markdown. Natural spoken voice."
-                        ),
-                        messages=[{"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"}],
+                            )},
+                            {"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"},
+                        ],
                     )
-                    msg = summary.content[0].text
+                    track_usage(data)
+                    msg = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
                 except Exception:
                     msg = f"Sir, {project_name} finished. Here's the gist: {full_response[:200]}"
             else:
@@ -1092,15 +1226,18 @@ async def self_work_and_notify(session: WorkSession, prompt: str, ws):
         log.info(f"Background work complete ({len(full_response)} chars)")
 
         # Summarize and speak
-        if anthropic_client and full_response:
+        if llm_client and llm_client.configured and full_response:
             try:
-                summary = await anthropic_client.messages.create(
-                    model="claude-haiku-4-5-20251001",
+                data = await llm_client.chat_raw(
+                    model=llm_client.fast_model,
                     max_tokens=100,
-                    system="You are JARVIS. Summarize what you just completed in 1 sentence. First person — 'I built', 'I set up'. No markdown. Never say 'Claude Code'.",
-                    messages=[{"role": "user", "content": f"Claude Code completed:\n{full_response[:2000]}"}],
+                    messages=[
+                        {"role": "system", "content": "You are JARVIS. Summarize what you just completed in 1 sentence. First person — 'I built', 'I set up'. No markdown. Never say 'Claude Code'."},
+                        {"role": "user", "content": f"Claude Code completed:\n{full_response[:2000]}"},
+                    ],
                 )
-                msg = summary.content[0].text
+                track_usage(data)
+                msg = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
             except Exception:
                 msg = "Work is complete, sir."
 
@@ -1163,14 +1300,14 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
 
 async def generate_response(
     text: str,
-    client: anthropic.AsyncAnthropic,
+    client: OpenRouterClient,
     task_mgr: ClaudeTaskManager,
     projects: list[dict],
     conversation_history: list[dict],
     last_response: str = "",
     session_summary: str = "",
 ) -> str:
-    """Generate a JARVIS response using Anthropic API."""
+    """Generate a JARVIS response using OpenRouter."""
     now = datetime.now()
     current_time = now.strftime("%A, %B %d, %Y at %I:%M %p")
 
@@ -1221,14 +1358,13 @@ async def generate_response(
         messages = messages + [{"role": "user", "content": text}]
 
     try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=250,  # Extra room for [ACTION:X] tags
-            system=system,
-            messages=messages,
+        data = await client.chat_raw(
+            model=client.fast_model,
+            max_tokens=250,
+            messages=[{"role": "system", "content": system}] + messages,
         )
-        track_usage(response)
-        return response.content[0].text
+        track_usage(data)
+        return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
     except Exception as e:
         log.error(f"LLM error: {e}")
         return "Apologies, sir. I'm having trouble connecting to my language systems."
@@ -1240,7 +1376,7 @@ async def generate_response(
 
 # Shared state
 task_manager = ClaudeTaskManager(max_concurrent=3)
-anthropic_client: Optional[anthropic.AsyncAnthropic] = None
+llm_client: Optional[OpenRouterClient] = None
 cached_projects: list[dict] = []
 recently_built: list[dict] = []  # [{"name": str, "path": str, "time": float}]
 dispatch_registry = DispatchRegistry()
@@ -1297,9 +1433,9 @@ def _cost_from_tokens(input_t: int, output_t: int) -> float:
 
 
 def track_usage(response):
-    """Track token usage from an Anthropic API response."""
-    inp = getattr(response.usage, "input_tokens", 0) if hasattr(response, "usage") else 0
-    out = getattr(response.usage, "output_tokens", 0) if hasattr(response, "usage") else 0
+    usage = (response or {}).get("usage") or {}
+    inp = int(usage.get("prompt_tokens") or 0)
+    out = int(usage.get("completion_tokens") or 0)
     _session_tokens["input"] += inp
     _session_tokens["output"] += out
     _session_tokens["api_calls"] += 1
@@ -1349,9 +1485,10 @@ def _refresh_context_sync():
         while True:
             try:
                 # Screen — fast
-                try:
-                    proc = __import__("subprocess").run(
-                        ["osascript", "-e", '''
+                if sys.platform == "darwin" and shutil.which("osascript"):
+                    try:
+                        proc = __import__("subprocess").run(
+                            ["osascript", "-e", '''
 set windowList to ""
 tell application "System Events"
     set frontApp to name of first application process whose frontmost is true
@@ -1375,22 +1512,22 @@ tell application "System Events"
 end tell
 return windowList
 '''],
-                        capture_output=True, text=True, timeout=5
-                    )
-                    if proc.returncode == 0 and proc.stdout.strip():
-                        windows = []
-                        for line in proc.stdout.strip().split("\n"):
-                            parts = line.strip().split("|||")
-                            if len(parts) >= 3:
-                                windows.append({
-                                    "app": parts[0].strip(),
-                                    "title": parts[1].strip(),
-                                    "frontmost": parts[2].strip().lower() == "true",
-                                })
-                        if windows:
-                            _ctx_cache["screen"] = format_windows_for_context(windows)
-                except Exception:
-                    pass
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if proc.returncode == 0 and proc.stdout.strip():
+                            windows = []
+                            for line in proc.stdout.strip().split("\n"):
+                                parts = line.strip().split("|||")
+                                if len(parts) >= 3:
+                                    windows.append({
+                                        "app": parts[0].strip(),
+                                        "title": parts[1].strip(),
+                                        "frontmost": parts[2].strip().lower() == "true",
+                                    })
+                            if windows:
+                                _ctx_cache["screen"] = format_windows_for_context(windows)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 log.debug(f"Context thread error: {e}")
@@ -1410,11 +1547,10 @@ return windowList
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global anthropic_client, cached_projects
-    if ANTHROPIC_API_KEY:
-        anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    else:
-        log.warning("ANTHROPIC_API_KEY not set — LLM features disabled")
+    global llm_client, cached_projects
+    llm_client = load_openrouter_client()
+    if not llm_client.configured:
+        log.warning("OPENROUTER_API_KEY not set — LLM features disabled")
     cached_projects = []
 
     # Start context refresh in a separate thread (never touches event loop)
@@ -1428,11 +1564,73 @@ app = FastAPI(title="JARVIS Server", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=JARVIS_ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_rate_state: dict[str, list[float]] = {}
+
+
+def _rate_check(key: str, limit: int, window_seconds: int = 60) -> bool:
+    """Return True if rate-limited."""
+    now = time.time()
+    bucket = _rate_state.get(key, [])
+    cutoff = now - window_seconds
+    bucket = [t for t in bucket if t >= cutoff]
+    if len(bucket) >= limit:
+        _rate_state[key] = bucket
+        return True
+    bucket.append(now)
+    _rate_state[key] = bucket
+    return False
+
+
+@app.middleware("http")
+async def _auth_middleware(request: Request, call_next):
+    if request.url.path.startswith("/api") and request.url.path != "/api/health":
+        client_ip = request.client.host if request.client else "unknown"
+        path = request.url.path
+
+        # Basic rate limiting (best-effort, in-memory)
+        # - Settings endpoints: stricter
+        # - Task endpoints: moderate
+        # - Everything else: loose
+        if path.startswith("/api/settings/"):
+            if _rate_check(f"{client_ip}:settings", limit=20):
+                return JSONResponse(status_code=429, content={"error": "rate_limited"})
+        elif path.startswith("/api/tasks"):
+            if _rate_check(f"{client_ip}:tasks", limit=30):
+                return JSONResponse(status_code=429, content={"error": "rate_limited"})
+        else:
+            if _rate_check(f"{client_ip}:api", limit=120):
+                return JSONResponse(status_code=429, content={"error": "rate_limited"})
+
+        if not _is_authorized_http(request):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        if request.url.path in ("/api/restart", "/api/fix-self") and not JARVIS_DEV_MODE:
+            return JSONResponse(status_code=404, content={"error": "not found"})
+    return await call_next(request)
+
+
+def _sanitize_working_dir(working_dir: str) -> str:
+    raw = (working_dir or "").strip()
+    base = JARVIS_PROJECTS_DIR.resolve()
+    if not raw or raw == ".":
+        return str(base)
+    try:
+        resolved = Path(raw).expanduser().resolve()
+    except Exception:
+        raise ValueError("Invalid working_dir")
+    if resolved == base:
+        return str(resolved)
+    try:
+        if resolved.is_relative_to(base):
+            return str(resolved)
+    except Exception:
+        pass
+    raise ValueError("working_dir must be inside JARVIS_PROJECTS_DIR")
 
 
 # -- REST Endpoints --------------------------------------------------------
@@ -1484,10 +1682,13 @@ async def api_get_task(task_id: str):
 @app.post("/api/tasks")
 async def api_create_task(req: TaskRequest):
     try:
-        task_id = await task_manager.spawn(req.prompt, req.working_dir)
+        safe_dir = _sanitize_working_dir(req.working_dir)
+        task_id = await task_manager.spawn(req.prompt, safe_dir)
         return {"task_id": task_id, "status": "spawned"}
     except RuntimeError as e:
         return JSONResponse(status_code=429, content={"error": str(e)})
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 
 @app.delete("/api/tasks/{task_id}")
@@ -1511,11 +1712,11 @@ async def api_list_projects():
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:
-    """Synchronous Desktop scan — runs in executor."""
+    """Synchronous scan — runs in executor."""
     projects = []
-    desktop = Path.home() / "Desktop"
+    root = JARVIS_PROJECTS_DIR
     try:
-        for entry in desktop.iterdir():
+        for entry in root.iterdir():
             if entry.is_dir() and not entry.name.startswith("."):
                 projects.append({"name": entry.name, "path": str(entry), "branch": ""})
     except Exception:
@@ -1602,7 +1803,7 @@ async def handle_open_terminal() -> str:
 
 async def handle_build(target: str) -> str:
     name = _generate_project_name(target)
-    path = str(Path.home() / "Desktop" / name)
+    path = str(JARVIS_PROJECTS_DIR / name)
     os.makedirs(path, exist_ok=True)
 
     # Write CLAUDE.md with clear instructions
@@ -1614,19 +1815,10 @@ async def handle_build(target: str) -> str:
     prompt_file = Path(path) / ".jarvis_prompt.txt"
     prompt_file.write_text(target)
 
+    from shlex import quote as shell_quote
     skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
-    escaped_path = applescript_escape(path)
-    script = (
-        'tell application "Terminal"\n'
-        "    activate\n"
-        f'    do script "cd {escaped_path} && cat .jarvis_prompt.txt | claude -p{skip_flag}"\n'
-        "end tell"
-    )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    cmd = f"cd {shell_quote(path)} && cat .jarvis_prompt.txt | claude -p{skip_flag}"
+    await open_terminal(cmd)
 
     recently_built.append({"name": name, "path": path, "time": time.time()})
     return f"On it, sir. Claude Code is working in {name}."
@@ -1651,11 +1843,8 @@ async def handle_show_recent() -> str:
         await open_browser(f"file://{html_files[0]}")
         return f"Opened {html_files[0].name} from {last['name']}, sir."
 
-    # Fall back to opening the folder in Finder
-    escaped_last_path = applescript_escape(last["path"])
-    script = f'tell application "Finder"\nactivate\nopen POSIX file "{escaped_last_path}"\nend tell'
-    await asyncio.create_subprocess_exec("osascript", "-e", script, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    return f"Opened the {last['name']} folder in Finder, sir."
+    await open_browser(f"file://{last['path']}")
+    return f"Opened the {last['name']} folder, sir."
 
 
 # ---------------------------------------------------------------------------
@@ -1762,8 +1951,8 @@ async def _do_mail_lookup() -> str:
 
 async def _do_screen_lookup() -> str:
     """Screen describe — runs in thread."""
-    if anthropic_client:
-        return await describe_screen(anthropic_client)
+    if llm_client and llm_client.configured:
+        return await describe_screen(llm_client)
     windows = await get_active_windows()
     if windows:
         apps = set(w["app"] for w in windows)
@@ -1835,9 +2024,7 @@ async def handle_browse(text: str, target: str) -> str:
 
     # 3. Fall back to Google search with cleaned query
     query = target
-    for prefix in ["search for", "look up", "google", "find me", "pull up", "open chrome",
-                    "open firefox", "open browser", "go to", "can you", "in the browser",
-                    "can you go to", "please"]:
+    for prefix in ACTION_KEYWORDS["browse"] + ["can you", "can you go to", "please"]:
         query = query.lower().replace(prefix, "").strip()
     # Remove filler words
     query = re.sub(r'\b(can|you|the|in|to|a|an|for|me|my|please)\b', '', query).strip()
@@ -1851,16 +2038,22 @@ async def handle_browse(text: str, target: str) -> str:
     return "Searching for that, sir."
 
 
-async def handle_research(text: str, target: str, client: anthropic.AsyncAnthropic) -> str:
+async def handle_research(text: str, target: str, client: OpenRouterClient) -> str:
     """Deep research with Opus — write results to HTML, open in browser."""
     try:
-        research_response = await client.messages.create(
-            model="claude-opus-4-6",
+        research_data = await client.chat_raw(
+            model=client.research_model,
             max_tokens=2000,
-            system=f"You are JARVIS, researching a topic for {USER_NAME}. Be thorough, organized, and cite sources where possible.",
-            messages=[{"role": "user", "content": f"Research this thoroughly:\n\n{target}"}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are JARVIS, researching a topic for {USER_NAME}. Be thorough, organized, and cite sources where possible.",
+                },
+                {"role": "user", "content": f"Research this thoroughly:\n\n{target}"},
+            ],
         )
-        research_text = research_response.content[0].text
+        track_usage(research_data)
+        research_text = ((research_data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
 
         import html as _html
         html_content = f"""<!DOCTYPE html>
@@ -1883,20 +2076,24 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
 <p style="color:#555;font-size:0.8em">Researched by JARVIS using Claude Opus &bull; {datetime.now().strftime('%B %d, %Y %I:%M %p')}</p>
 </body></html>"""
 
-        results_file = Path.home() / "Desktop" / ".jarvis_research.html"
+        results_file = JARVIS_PROJECTS_DIR / ".jarvis_research.html"
         results_file.write_text(html_content)
 
         browser_name = "firefox" if "firefox" in text.lower() else "chrome"
         await open_browser(f"file://{results_file}", browser_name)
 
-        # Short voice summary via Haiku
-        summary = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        # Short voice summary (fast model)
+        summary_data = await client.chat_raw(
+            model=client.fast_model,
             max_tokens=80,
-            system="Summarize this research in ONE sentence for voice. No markdown.",
-            messages=[{"role": "user", "content": research_text[:2000]}],
+            messages=[
+                {"role": "system", "content": "Summarize this research in ONE sentence for voice. No markdown."},
+                {"role": "user", "content": research_text[:2000]},
+            ],
         )
-        return summary.content[0].text + " Full results are in your browser, sir."
+        track_usage(summary_data)
+        summary_text = ((summary_data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
+        return (summary_text or "Done, sir.") + " Full results are in your browser, sir."
 
     except Exception as e:
         log.error(f"Research failed: {e}")
@@ -1910,7 +2107,7 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
 async def _update_session_summary(
     old_summary: str,
     rotated_messages: list[dict],
-    client: anthropic.AsyncAnthropic,
+    client: OpenRouterClient,
 ) -> str:
     """Background Haiku call to update the rolling session summary."""
     prompt = f"""Update this conversation summary to include the new messages.
@@ -1923,12 +2120,14 @@ New messages to incorporate:
 Write an updated summary in 2-4 sentences capturing the key topics, decisions, and context. Be concise."""
 
     try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        data = await client.chat_raw(
+            model=client.fast_model,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.content[0].text.strip()
+        track_usage(data)
+        text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
+        return text.strip()
     except Exception as e:
         log.warning(f"Summary update failed: {e}")
         return old_summary  # Keep old summary on failure
@@ -1950,6 +2149,10 @@ async def voice_handler(ws: WebSocket):
         {"type": "task_spawned", "task_id": "...", "prompt": "..."}
         {"type": "task_complete", "task_id": "...", "summary": "..."}
     """
+    if not _is_authorized_ws(ws):
+        await ws.close(code=1008)
+        return
+
     await ws.accept()
     task_manager.register_websocket(ws)
     history: list[dict] = []
@@ -2020,6 +2223,9 @@ async def voice_handler(ws: WebSocket):
 
             # ── Fix-self: activate work mode in JARVIS repo ──
             if msg.get("type") == "fix_self":
+                if not JARVIS_DEV_MODE:
+                    await ws.send_json({"type": "text", "text": "That feature is disabled, sir."})
+                    continue
                 jarvis_dir = str(Path(__file__).parent)
                 await work_session.start(jarvis_dir)
                 response_text = "Work mode active in my own repo, sir. Tell me what needs fixing."
@@ -2038,6 +2244,8 @@ async def voice_handler(ws: WebSocket):
             user_text = apply_speech_corrections(msg.get("text", "").strip())
             if not user_text:
                 continue
+
+            client = llm_client if (llm_client and llm_client.configured) else None
 
             # Cancel any in-flight response
             _current_response_id += 1
@@ -2080,7 +2288,7 @@ async def voice_handler(ws: WebSocket):
                                     plan.answers[q["key"]] = q["default"]
                         prompt = await planner.build_prompt()
                         name = _generate_project_name(prompt)
-                        path = str(Path.home() / "Desktop" / name)
+                        path = str(JARVIS_PROJECTS_DIR / name)
                         os.makedirs(path, exist_ok=True)
                         Path(path, "CLAUDE.md").write_text(prompt)
                         did = dispatch_registry.register(name, path, prompt[:200])
@@ -2093,7 +2301,7 @@ async def voice_handler(ws: WebSocket):
                         if result["confirmed"]:
                             prompt = await planner.build_prompt()
                             name = _generate_project_name(prompt)
-                            path = str(Path.home() / "Desktop" / name)
+                            path = str(JARVIS_PROJECTS_DIR / name)
                             os.makedirs(path, exist_ok=True)
                             Path(path, "CLAUDE.md").write_text(prompt)
                             did = dispatch_registry.register(name, path, prompt[:200])
@@ -2124,7 +2332,7 @@ async def voice_handler(ws: WebSocket):
                     if is_casual_question(user_text):
                         # Quick chat — bypass claude -p, use Haiku
                         response_text = await generate_response(
-                            user_text, anthropic_client, task_manager,
+                            user_text, client, task_manager,
                             cached_projects, history,
                             last_response=last_jarvis_response,
                             session_summary=session_summary,
@@ -2137,7 +2345,7 @@ async def voice_handler(ws: WebSocket):
                         full_response = await work_session.send(user_text)
 
                         # Detect if Claude Code is stalling (asking questions instead of building)
-                        if full_response and anthropic_client:
+                        if full_response and client:
                             stall_words = ["which option", "would you prefer", "would you like me to",
                                            "before I proceed", "before proceeding", "should I",
                                            "do you want me to", "let me know", "please confirm",
@@ -2161,22 +2369,28 @@ async def voice_handler(ws: WebSocket):
                             log.info(f"Auto-opening {localhost_match.group(0)}")
 
                         # Always summarize work mode responses via Haiku
-                        if full_response and anthropic_client:
+                        if full_response and client:
                             try:
-                                summary = await anthropic_client.messages.create(
-                                    model="claude-haiku-4-5-20251001",
+                                summary_data = await client.chat_raw(
+                                    model=client.fast_model,
                                     max_tokens=100,
-                                    system=(
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": (
                                         f"You are JARVIS reporting to the user ({USER_NAME}). Summarize what happened in 1-2 sentences. "
                                         "Speak in first person — 'I built', 'I found', 'I set up'. "
                                         "You are talking TO THE USER, not to a coding tool. "
                                         "NEVER give instructions like 'go ahead and build' or 'set up the frontend' — those are NOT for the user. "
                                         "NEVER say 'Claude Code'. NEVER output [ACTION:...] tags. "
                                         "NEVER read out URLs. No markdown. British precision."
-                                    ),
-                                    messages=[{"role": "user", "content": f"Claude Code said:\n{full_response[:2000]}"}],
+                                            ),
+                                        },
+                                        {"role": "user", "content": f"Claude Code said:\n{full_response[:2000]}"},
+                                    ],
                                 )
-                                response_text = summary.content[0].text
+                                track_usage(summary_data)
+                                response_text = ((summary_data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
                             except Exception:
                                 response_text = full_response[:200]
                         else:
@@ -2224,11 +2438,11 @@ async def voice_handler(ws: WebSocket):
                         else:
                             response_text = "Understood, sir."
                     else:
-                        if not anthropic_client:
+                        if not client:
                             response_text = "API key not configured."
                         else:
                             response_text = await generate_response(
-                                user_text, anthropic_client, task_manager,
+                                user_text, client, task_manager,
                                 cached_projects, history,
                                 last_response=last_jarvis_response,
                                 session_summary=session_summary,
@@ -2256,7 +2470,7 @@ async def voice_handler(ws: WebSocket):
                                     # Build in background — JARVIS stays conversational
                                     target = embedded_action["target"]
                                     name = _generate_project_name(target)
-                                    path = str(Path.home() / "Desktop" / name)
+                                    path = str(JARVIS_PROJECTS_DIR / name)
                                     os.makedirs(path, exist_ok=True)
 
                                     # Write detailed CLAUDE.md
@@ -2285,7 +2499,7 @@ async def voice_handler(ws: WebSocket):
                                 elif embedded_action["action"] == "research":
                                     # Research enters work mode too
                                     name = _generate_project_name(embedded_action["target"])
-                                    path = str(Path.home() / "Desktop" / name)
+                                    path = str(JARVIS_PROJECTS_DIR / name)
                                     os.makedirs(path, exist_ok=True)
                                     await work_session.start(path)
                                     asyncio.create_task(
@@ -2381,11 +2595,11 @@ async def voice_handler(ws: WebSocket):
                     messages_since_last_summary = 0
                     # Get messages that are about to be rotated out
                     rotated = history[:-20] if len(history) > 20 else []
-                    if rotated and anthropic_client:
+                    if rotated and client:
                         async def _do_summary():
                             nonlocal session_summary, summary_update_pending
                             session_summary = await _update_session_summary(
-                                session_summary, rotated, anthropic_client
+                                session_summary, rotated, client
                             )
                             summary_update_pending = False
                         asyncio.create_task(_do_summary())
@@ -2393,8 +2607,8 @@ async def voice_handler(ws: WebSocket):
                         summary_update_pending = False
 
                 # Extract memories in background (doesn't block response)
-                if anthropic_client and len(user_text) > 15:
-                    asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
+                if client and len(user_text) > 15:
+                    asyncio.create_task(extract_memories(user_text, response_text, client))
 
                 # TTS
                 tts = strip_markdown_for_tts(response_text)
@@ -2491,23 +2705,48 @@ class PreferencesUpdate(BaseModel):
 
 @app.post("/api/settings/keys")
 async def api_settings_keys(body: KeyUpdate):
-    allowed = {"ANTHROPIC_API_KEY", "FISH_API_KEY", "FISH_VOICE_ID", "USER_NAME", "HONORIFIC", "CALENDAR_ACCOUNTS"}
+    allowed = {
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OPENROUTER_FAST_MODEL",
+        "OPENROUTER_RESEARCH_MODEL",
+        "OPENROUTER_VISION_MODEL",
+        "OPENROUTER_SITE_URL",
+        "OPENROUTER_APP_NAME",
+        "FISH_API_KEY",
+        "FISH_VOICE_ID",
+        "USER_NAME",
+        "HONORIFIC",
+        "CALENDAR_ACCOUNTS",
+    }
     if body.key_name not in allowed:
         return JSONResponse({"success": False, "error": "Invalid key name"}, status_code=400)
     _write_env_key(body.key_name, body.key_value)
+    global llm_client
+    llm_client = load_openrouter_client()
     return {"success": True}
 
-@app.post("/api/settings/test-anthropic")
-async def api_test_anthropic(body: KeyTest):
-    key = body.key_value or os.getenv("ANTHROPIC_API_KEY", "")
+@app.post("/api/settings/test-openrouter")
+async def api_test_openrouter(body: KeyTest):
+    key = body.key_value or os.getenv("OPENROUTER_API_KEY", "")
     if not key:
         return {"valid": False, "error": "No key provided"}
     try:
-        client = anthropic.AsyncAnthropic(api_key=key)
-        await client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=10, messages=[{"role": "user", "content": "Hi"}])
+        client = OpenRouterClient(
+            OpenRouterConfig(
+                api_key=key,
+                base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip(),
+                fast_model=os.getenv("OPENROUTER_FAST_MODEL", "anthropic/claude-3.5-haiku").strip(),
+                research_model=os.getenv("OPENROUTER_RESEARCH_MODEL", "anthropic/claude-3.5-sonnet").strip(),
+                vision_model=os.getenv("OPENROUTER_VISION_MODEL", "anthropic/claude-3.5-sonnet").strip(),
+                site_url=os.getenv("OPENROUTER_SITE_URL", "").strip(),
+                app_name=os.getenv("OPENROUTER_APP_NAME", "JARVIS").strip(),
+            )
+        )
+        await client.chat_raw(model=client.fast_model, max_tokens=10, messages=[{"role": "user", "content": "Hi"}])
         return {"valid": True}
-    except Exception as e:
-        return {"valid": False, "error": str(e)[:200]}
+    except Exception:
+        return {"valid": False, "error": "Test failed"}
 
 @app.post("/api/settings/test-fish")
 async def api_test_fish(body: KeyTest):
@@ -2527,8 +2766,8 @@ async def api_test_fish(body: KeyTest):
                 return {"valid": False, "error": "Invalid API key"}
             else:
                 return {"valid": False, "error": f"HTTP {resp.status_code}"}
-    except Exception as e:
-        return {"valid": False, "error": str(e)[:200]}
+    except Exception:
+        return {"valid": False, "error": "Test failed"}
 
 @app.get("/api/settings/status")
 async def api_settings_status():
@@ -2557,7 +2796,7 @@ async def api_settings_status():
         "server_port": 8340,
         "uptime_seconds": int(time.time() - _session_start),
         "env_keys_set": {
-            "anthropic": bool(env_dict.get("ANTHROPIC_API_KEY", "").strip() and env_dict.get("ANTHROPIC_API_KEY", "") != "your-anthropic-api-key-here"),
+            "openrouter": bool(env_dict.get("OPENROUTER_API_KEY", "").strip() and env_dict.get("OPENROUTER_API_KEY", "") != "your-openrouter-api-key-here"),
             "fish_audio": bool(env_dict.get("FISH_API_KEY", "").strip() and env_dict.get("FISH_API_KEY", "") != "your-fish-audio-api-key-here"),
             "fish_voice_id": bool(env_dict.get("FISH_VOICE_ID", "").strip()),
             "user_name": env_dict.get("USER_NAME", ""),
@@ -2590,7 +2829,11 @@ async def api_restart():
     log.info("Restart requested — shutting down in 2 seconds")
     async def _restart():
         await asyncio.sleep(2)
-        cmd = [sys.executable, __file__, "--port", "8340", "--host", "0.0.0.0"]
+        cmd = [sys.executable, __file__, "--port", "8340", "--host", "127.0.0.1"]
+        cert_file = Path(__file__).parent / "cert.pem"
+        key_file = Path(__file__).parent / "key.pem"
+        if cert_file.exists() and key_file.exists():
+            cmd.append("--ssl")
         os.execv(sys.executable, cmd)
     asyncio.create_task(_restart())
     return {"status": "restarting"}
@@ -2600,21 +2843,9 @@ async def api_restart():
 async def api_fix_self():
     """Enter work mode in the JARVIS repo — JARVIS can now fix himself."""
     jarvis_dir = str(Path(__file__).parent)
-    # The work_session is per-WebSocket, so we set a flag that the handler picks up
-    # For now, also open Terminal so user can see
     skip_flag = " --dangerously-skip-permissions" if _SKIP_PERMISSIONS else ""
-    escaped_jarvis_dir = applescript_escape(jarvis_dir)
-    script = (
-        'tell application "Terminal"\n'
-        '    activate\n'
-        f'    do script "cd {escaped_jarvis_dir} && claude{skip_flag}"\n'
-        'end tell'
-    )
-    await asyncio.create_subprocess_exec(
-        "osascript", "-e", script,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    from shlex import quote as shell_quote
+    await open_terminal(f"cd {shell_quote(jarvis_dir)} && claude{skip_flag}")
     log.info("Work mode: JARVIS repo opened for self-improvement")
     return {"status": "work_mode_active", "path": jarvis_dir}
 
@@ -2645,7 +2876,7 @@ if __name__ == "__main__":
     import uvicorn
 
     parser = argparse.ArgumentParser(description="JARVIS Server")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind host")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind host")
     parser.add_argument("--port", type=int, default=8340, help="Bind port")
     parser.add_argument("--reload", action="store_true", help="Auto-reload on changes")
     parser.add_argument("--ssl", action="store_true", help="Enable HTTPS with key.pem/cert.pem")

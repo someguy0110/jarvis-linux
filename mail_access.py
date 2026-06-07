@@ -10,9 +10,19 @@ No send, delete, move, or modify functions exist by design.
 
 import asyncio
 import logging
+import os
+import sys
 from datetime import datetime
 
 log = logging.getLogger("jarvis.mail")
+
+_IS_DARWIN = sys.platform == "darwin"
+
+IMAP_HOST = os.getenv("IMAP_HOST", "").strip()
+IMAP_USERNAME = os.getenv("IMAP_USERNAME", "").strip()
+IMAP_PASSWORD = os.getenv("IMAP_PASSWORD", "").strip()
+IMAP_PORT = int(os.getenv("IMAP_PORT", "993").strip() or "993")
+IMAP_SSL = os.getenv("IMAP_SSL", "true").lower() not in ("0", "false", "no")
 
 _mail_launched = False
 
@@ -20,6 +30,8 @@ _mail_launched = False
 async def _ensure_mail_running():
     """Launch Mail.app if not already running."""
     global _mail_launched
+    if not _IS_DARWIN:
+        return
     if _mail_launched:
         return
 
@@ -53,6 +65,8 @@ async def _ensure_mail_running():
 
 async def _run_mail_script(script: str, timeout: float = 20) -> str:
     """Run an AppleScript against Mail.app and return output."""
+    if not _IS_DARWIN:
+        return ""
     await _ensure_mail_running()
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -78,6 +92,8 @@ async def _run_mail_script(script: str, timeout: float = 20) -> str:
 
 async def get_accounts() -> list[str]:
     """Get list of configured mail account names."""
+    if not _IS_DARWIN:
+        return [IMAP_USERNAME] if _imap_configured() else []
     script = """
 tell application "Mail"
     return name of every account
@@ -94,6 +110,8 @@ async def get_unread_count() -> dict:
 
     Returns: {"total": int, "accounts": {"Google": 5, "Work": 3, ...}}
     """
+    if not _IS_DARWIN:
+        return await _imap_get_unread_count()
     script = """
 tell application "Mail"
     set totalUnread to unread count of inbox
@@ -130,6 +148,8 @@ async def get_recent_messages(count: int = 10) -> list[dict]:
 
     Returns list of {"sender", "subject", "date", "read", "account", "preview"}.
     """
+    if not _IS_DARWIN:
+        return await _imap_get_recent_messages(count=count)
     script = f"""
 tell application "Mail"
     set allMsgs to messages of inbox
@@ -179,6 +199,8 @@ end tell
 
 async def get_unread_messages(count: int = 10) -> list[dict]:
     """Get unread messages from unified inbox."""
+    if not _IS_DARWIN:
+        return await _imap_get_unread_messages(count=count)
     script = f"""
 tell application "Mail"
     set allMsgs to messages of inbox whose read status is false
@@ -225,6 +247,8 @@ end tell
 
 async def get_messages_from_account(account_name: str, count: int = 10) -> list[dict]:
     """Get recent messages from a specific account's inbox."""
+    if not _IS_DARWIN:
+        return await _imap_get_recent_messages(count=count)
     escaped = account_name.replace('"', '\\"')
     script = f"""
 tell application "Mail"
@@ -267,6 +291,8 @@ async def search_mail(query: str, count: int = 10) -> list[dict]:
     Uses AppleScript filtering on subject. For broader search,
     we check both subject and sender.
     """
+    if not _IS_DARWIN:
+        return await _imap_search_messages(query=query, count=count)
     escaped = query.replace("\\", "\\\\").replace('"', '\\"')
     script = f"""
 tell application "Mail"
@@ -309,6 +335,8 @@ async def read_message(subject_match: str) -> dict | None:
 
     Returns {"sender", "subject", "date", "content"} or None.
     """
+    if not _IS_DARWIN:
+        return await _imap_read_message(subject_match=subject_match)
     escaped = subject_match.replace("\\", "\\\\").replace('"', '\\"')
     script = f"""
 tell application "Mail"
@@ -412,3 +440,261 @@ def _short_sender(sender: str) -> str:
     if "@" in sender:
         return sender.split("@")[0]
     return sender
+
+
+def _imap_configured() -> bool:
+    return bool(IMAP_HOST and IMAP_USERNAME and IMAP_PASSWORD)
+
+
+def _decode_header_value(value: str) -> str:
+    from email.header import decode_header
+
+    parts = decode_header(value)
+    out = []
+    for chunk, enc in parts:
+        if isinstance(chunk, bytes):
+            try:
+                out.append(chunk.decode(enc or "utf-8", errors="ignore"))
+            except Exception:
+                out.append(chunk.decode("utf-8", errors="ignore"))
+        else:
+            out.append(str(chunk))
+    return "".join(out).strip()
+
+
+def _imap_connect():
+    import imaplib
+
+    if IMAP_SSL:
+        conn = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT)
+    else:
+        conn = imaplib.IMAP4(IMAP_HOST, IMAP_PORT)
+    conn.login(IMAP_USERNAME, IMAP_PASSWORD)
+    return conn
+
+
+def _imap_get_ids(conn) -> list[bytes]:
+    conn.select("INBOX")
+    typ, data = conn.search(None, "ALL")
+    if typ != "OK" or not data or not data[0]:
+        return []
+    return data[0].split()
+
+
+def _imap_get_unseen_ids(conn) -> list[bytes]:
+    conn.select("INBOX")
+    typ, data = conn.search(None, "UNSEEN")
+    if typ != "OK" or not data or not data[0]:
+        return []
+    return data[0].split()
+
+
+def _imap_parse_message(conn, msg_id: bytes, include_body: bool = False) -> dict:
+    import email
+    from email.utils import parsedate_to_datetime
+
+    fetch_parts = "(BODY.PEEK[HEADER] FLAGS)"
+    if include_body:
+        fetch_parts = "(BODY.PEEK[] FLAGS)"
+
+    typ, data = conn.fetch(msg_id, fetch_parts)
+    if typ != "OK" or not data:
+        return {}
+
+    raw = b""
+    flags = ""
+    for item in data:
+        if not item or not isinstance(item, tuple):
+            continue
+        meta = item[0].decode(errors="ignore")
+        raw = item[1] or b""
+        if "FLAGS" in meta:
+            flags = meta
+
+    msg = email.message_from_bytes(raw)
+    sender = _decode_header_value(msg.get("From", ""))
+    subject = _decode_header_value(msg.get("Subject", ""))
+    date_hdr = msg.get("Date", "")
+    try:
+        dt = parsedate_to_datetime(date_hdr)
+        date_str = dt.isoformat(timespec="seconds") if dt else date_hdr
+    except Exception:
+        date_str = date_hdr
+
+    is_seen = "\\Seen" in flags
+    result = {
+        "sender": sender,
+        "subject": subject,
+        "date": date_str,
+        "read": is_seen,
+        "preview": "",
+    }
+
+    if include_body:
+        body_text = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                disp = (part.get("Content-Disposition") or "").lower()
+                if "attachment" in disp:
+                    continue
+                if ctype == "text/plain":
+                    payload = part.get_payload(decode=True) or b""
+                    charset = part.get_content_charset() or "utf-8"
+                    body_text = payload.decode(charset, errors="ignore")
+                    break
+        else:
+            payload = msg.get_payload(decode=True) or b""
+            charset = msg.get_content_charset() or "utf-8"
+            body_text = payload.decode(charset, errors="ignore")
+
+        if body_text:
+            result["preview"] = body_text.strip().replace("\r", " ").replace("\n", " ")[:150]
+            result["content"] = body_text.strip()[:3000]
+
+    return result
+
+
+async def _imap_get_unread_count() -> dict:
+    if not _imap_configured():
+        return {"total": 0, "accounts": {}}
+
+    def _work():
+        conn = _imap_connect()
+        try:
+            unseen = _imap_get_unseen_ids(conn)
+            total = len(unseen)
+            return {"total": total, "accounts": {"INBOX": total}}
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    return await asyncio.to_thread(_work)
+
+
+async def _imap_get_recent_messages(count: int = 10) -> list[dict]:
+    if not _imap_configured():
+        return []
+
+    def _work():
+        conn = _imap_connect()
+        try:
+            ids = _imap_get_ids(conn)
+            ids = ids[-count:][::-1]
+            out = []
+            for msg_id in ids:
+                item = _imap_parse_message(conn, msg_id, include_body=False)
+                if item:
+                    out.append(item)
+            return out
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    return await asyncio.to_thread(_work)
+
+
+async def _imap_get_unread_messages(count: int = 10) -> list[dict]:
+    if not _imap_configured():
+        return []
+
+    def _work():
+        conn = _imap_connect()
+        try:
+            ids = _imap_get_unseen_ids(conn)
+            ids = ids[-count:][::-1]
+            out = []
+            for msg_id in ids:
+                item = _imap_parse_message(conn, msg_id, include_body=False)
+                if item:
+                    item["read"] = False
+                    out.append(item)
+            return out
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    return await asyncio.to_thread(_work)
+
+
+async def _imap_search_messages(query: str, count: int = 10) -> list[dict]:
+    if not _imap_configured() or not query.strip():
+        return []
+
+    q = query.strip()
+    q_lower = q.lower()
+
+    def _work():
+        conn = _imap_connect()
+        try:
+            conn.select("INBOX")
+            ids: list[bytes] = []
+            try:
+                typ, data = conn.search(None, "OR", "SUBJECT", f'"{q}"', "FROM", f'"{q}"')
+                if typ == "OK" and data and data[0]:
+                    ids = data[0].split()
+            except Exception:
+                ids = []
+
+            if not ids:
+                ids = _imap_get_ids(conn)
+
+            ids = ids[::-1][:200]
+            out = []
+            for msg_id in ids:
+                item = _imap_parse_message(conn, msg_id, include_body=False)
+                if not item:
+                    continue
+                if q_lower in item.get("subject", "").lower() or q_lower in item.get("sender", "").lower():
+                    out.append(item)
+                if len(out) >= count:
+                    break
+            return out
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    return await asyncio.to_thread(_work)
+
+
+async def _imap_read_message(subject_match: str) -> dict | None:
+    if not _imap_configured() or not subject_match.strip():
+        return None
+
+    q = subject_match.strip().lower()
+
+    def _work():
+        conn = _imap_connect()
+        try:
+            ids = _imap_get_ids(conn)
+            ids = ids[::-1][:200]
+            for msg_id in ids:
+                meta = _imap_parse_message(conn, msg_id, include_body=False)
+                if not meta:
+                    continue
+                if q in meta.get("subject", "").lower():
+                    full = _imap_parse_message(conn, msg_id, include_body=True)
+                    if not full:
+                        return None
+                    return {
+                        "sender": full.get("sender", ""),
+                        "subject": full.get("subject", ""),
+                        "date": full.get("date", ""),
+                        "content": full.get("content", "") or "",
+                    }
+            return None
+        finally:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+
+    return await asyncio.to_thread(_work)

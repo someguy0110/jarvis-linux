@@ -1,12 +1,12 @@
 # JARVIS — Voice AI Assistant
 
 ## Overview
-JARVIS (Just A Rather Very Intelligent System) is a voice-first AI assistant for macOS. It runs locally on your machine, connecting to your Apple Calendar, Mail, Notes, and can spawn Claude Code sessions for development tasks.
+JARVIS (Just A Rather Very Intelligent System) is a voice-first AI assistant for Linux. It runs locally on your machine, connecting to your calendar (CalDAV), mail (IMAP, read-only), notes (filesystem), and can spawn Claude Code sessions for development tasks.
 
 ## Quick Start
 When a user clones this repo and starts Claude Code, help them:
 1. Copy .env.example to .env
-2. Get an Anthropic API key from console.anthropic.com
+2. Get an OpenRouter API key from openrouter.ai
 3. Get a Fish Audio API key from fish.audio
 4. Install Python dependencies: pip install -r requirements.txt
 5. Install frontend dependencies: cd frontend && npm install
@@ -20,9 +20,9 @@ When a user clones this repo and starts Claude Code, help them:
 - **Backend**: FastAPI + Python (server.py, ~2300 lines)
 - **Frontend**: Vite + TypeScript + Three.js (audio-reactive orb)
 - **Communication**: WebSocket (JSON messages + binary audio)
-- **AI**: Claude Haiku for fast responses, Claude Opus for research
+- **AI**: LLM via OpenRouter (fast + deep models)
 - **TTS**: Fish Audio with JARVIS voice model
-- **System**: AppleScript for Calendar, Mail, Notes, Terminal integration
+- **System**: CalDAV (calendar) + IMAP (mail, read-only) + filesystem notes
 
 ## Key Files
 - `server.py` — Main server, WebSocket handler, LLM integration, action system
@@ -30,15 +30,15 @@ When a user clones this repo and starts Claude Code, help them:
 - `frontend/src/voice.ts` — Web Speech API + audio playback
 - `frontend/src/main.ts` — Frontend state machine
 - `memory.py` — SQLite memory system with FTS5 search
-- `calendar_access.py` — Apple Calendar integration via AppleScript
-- `mail_access.py` — Apple Mail integration (READ-ONLY)
-- `notes_access.py` — Apple Notes integration
+- `calendar_access.py` — Calendar integration (CalDAV)
+- `mail_access.py` — Mail integration (IMAP, read-only)
+- `notes_access.py` — Notes integration (filesystem)
 - `actions.py` — System actions (Terminal, Chrome, Claude Code)
 - `browser.py` — Playwright web automation
 - `work_mode.py` — Persistent Claude Code sessions
 
 ## Environment Variables
-- `ANTHROPIC_API_KEY` (required) — Claude API access
+- `OPENROUTER_API_KEY` (required) — LLM API access via OpenRouter
 - `FISH_API_KEY` (required) — Fish Audio TTS
 - `FISH_VOICE_ID` (optional) — Voice model ID
 - `USER_NAME` (optional) — Your name for JARVIS to use
@@ -48,6 +48,5 @@ When a user clones this repo and starts Claude Code, help them:
 - JARVIS personality: British butler, dry wit, economy of language
 - Max 1-2 sentences per voice response
 - Action tags: [ACTION:BUILD], [ACTION:BROWSE], [ACTION:RESEARCH], etc.
-- AppleScript for all macOS integrations (no OAuth needed)
 - Read-only for Mail (safety by design)
 - SQLite for all local data storage

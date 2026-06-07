@@ -2,9 +2,11 @@
 
 **Just A Rather Very Intelligent System.**
 
-A voice-first AI assistant that runs on your Mac. Talk to it, and it talks back -- with a British accent, dry wit, and an audio-reactive particle orb straight out of the MCU.
+A voice-first AI assistant that runs on Linux. Talk to it, and it talks back -- with a British accent, dry wit, and an audio-reactive particle orb straight out of the MCU.
 
-JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, spawn Claude Code sessions to build entire projects, and plan your day -- all through natural voice conversation.
+This project was originally built for macOS and has been converted to a Linux-first version. Calendar, mail, and notes are now powered by CalDAV, IMAP, and a local notes folder.
+
+JARVIS can browse the web, spawn Claude Code sessions to build entire projects, and plan your day -- all through natural voice conversation.
 
 > "Will do, sir."
 
@@ -29,11 +31,11 @@ JARVIS connects to your Apple Calendar, Mail, and Notes. It can browse the web, 
 
 ## Requirements
 
-- **macOS** (uses AppleScript for Calendar, Mail, Notes integration)
+- **Linux** (CalDAV + IMAP + filesystem notes)
 - **Python 3.11+**
 - **Node.js 18+**
 - **Google Chrome** (required for Web Speech API)
-- **Anthropic API key** -- powers the AI brain ([get one here](https://console.anthropic.com/))
+- **OpenRouter API key** -- powers the LLM brain ([get one here](https://openrouter.ai/keys))
 - **Fish Audio API key** -- powers the voice ([get one here](https://fish.audio/))
 - **Claude Code CLI** -- for spawning dev tasks ([install here](https://docs.anthropic.com/en/docs/claude-code))
 
@@ -72,14 +74,37 @@ openssl req -x509 -newkey rsa:2048 -keyout key.pem -out cert.pem -days 365 -node
 # 6. Start the backend (Terminal 1)
 python server.py
 
+# On first run, the server generates JARVIS_AUTH_TOKEN and writes it into .env.
+# Paste that token into the Settings panel (Access Token) so the UI can connect.
+
 # 7. Start the frontend (Terminal 2)
 cd frontend && npm run dev
 
 # 8. Open Chrome
-open http://localhost:5173
+xdg-open http://localhost:5173  # Linux (or just paste into your browser)
 ```
 
 Click the page once to enable audio, then speak. JARVIS will respond.
+
+## Running as a Linux service (systemd)
+
+An example `systemd --user` service file is included here:
+
+- `docs/systemd/jarvis.service`
+
+Typical setup:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+
+mkdir -p ~/.config/systemd/user
+cp docs/systemd/jarvis.service ~/.config/systemd/user/jarvis.service
+systemctl --user daemon-reload
+systemctl --user enable --now jarvis
+journalctl --user -u jarvis -f
+```
 
 ## Configuration
 
@@ -87,7 +112,7 @@ Edit your `.env` file:
 
 ```env
 # Required
-ANTHROPIC_API_KEY=your-anthropic-api-key-here
+OPENROUTER_API_KEY=your-openrouter-api-key-here
 FISH_API_KEY=your-fish-audio-api-key-here
 
 # Optional -- your name (JARVIS will address you personally)
@@ -101,15 +126,15 @@ CALENDAR_ACCOUNTS=you@gmail.com,work@company.com
 ## Architecture
 
 ```
-Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish Audio TTS -> WebSocket -> Speaker
+Microphone -> Web Speech API -> WebSocket -> FastAPI -> LLM (via OpenRouter) -> Fish Audio TTS -> WebSocket -> Speaker
                                                 |
                                                 v
                                         Claude Code Tasks
                                         (spawns real dev work)
                                                 |
                                                 v
-                                        AppleScript Bridge
-                                        (Calendar, Mail, Notes, Terminal)
+                                        System Integrations
+                                        (CalDAV/IMAP/notes folder)
 ```
 
 | Layer | Technology |
@@ -120,7 +145,7 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 | AI (fast) | Claude Haiku -- low-latency voice responses |
 | AI (deep) | Claude Opus -- research and complex tasks |
 | TTS | Fish Audio with JARVIS voice model |
-| System | AppleScript for all macOS integrations |
+| System | CalDAV (calendar) + IMAP (mail) + filesystem notes |
 
 ## How the Voice Loop Works
 
@@ -144,9 +169,9 @@ Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish A
 | `frontend/src/voice.ts` | Web Speech API + audio playback |
 | `frontend/src/main.ts` | Frontend state machine |
 | `memory.py` | SQLite memory system with FTS5 full-text search |
-| `calendar_access.py` | Apple Calendar integration via AppleScript |
-| `mail_access.py` | Apple Mail integration (read-only) |
-| `notes_access.py` | Apple Notes integration |
+| `calendar_access.py` | Calendar integration (CalDAV) |
+| `mail_access.py` | Mail integration (IMAP, read-only) |
+| `notes_access.py` | Notes integration (filesystem) |
 | `actions.py` | System actions (Terminal, Chrome, Claude Code) |
 | `browser.py` | Playwright web automation |
 | `work_mode.py` | Persistent Claude Code sessions |
@@ -167,13 +192,12 @@ JARVIS uses action tags to trigger real system actions:
 JARVIS remembers things you tell it using SQLite with FTS5 full-text search. Preferences, decisions, and facts persist across sessions.
 
 ### Calendar & Mail
-All macOS integrations use AppleScript -- no OAuth flows, no token management. Just native system access. Mail is intentionally read-only for safety.
+Calendar uses CalDAV and mail uses IMAP. Mail is intentionally read-only for safety.
 
 ## Contributing
 
 Contributions are welcome. Some areas that could use work:
 
-- **Linux/Windows support** -- replace AppleScript with cross-platform alternatives
 - **Alternative TTS engines** -- add ElevenLabs, OpenAI TTS, or local models
 - **Alternative LLMs** -- add OpenAI, Gemini, or local model support
 - **Mobile client** -- a companion app for voice interaction on the go
@@ -189,7 +213,7 @@ Free for personal, non-commercial use. Commercial use requires a license — vis
 
 Built by [Ethan](https://ethanplus.ai).
 
-Powered by [Anthropic Claude](https://anthropic.com) and [Fish Audio](https://fish.audio).
+Powered by [OpenRouter](https://openrouter.ai) (LLM routing) and [Fish Audio](https://fish.audio).
 
 Inspired by the AI that started it all -- Tony Stark's JARVIS.
 

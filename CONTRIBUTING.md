@@ -15,7 +15,7 @@ Thanks for your interest in contributing! Here's how to get involved.
 
 - **Bug fixes** — if something's broken, fix it
 - **New integrations** — Spotify, Slack, Notion, etc.
-- **Windows/Linux support** — the AppleScript integrations are macOS-only, cross-platform alternatives welcome
+- **Desktop support** — improve KDE/GNOME compatibility (screenshots, active windows, app launching)
 - **Better error handling** — things fail silently in places
 - **Voice improvements** — alternative TTS providers, better speech recognition
 - **New actions** — extend what JARVIS can do
@@ -32,7 +32,7 @@ Yes, `server.py` is a 2400-line monolith. It works. If you want to refactor part
 ## What NOT to Do
 
 - Don't add telemetry or analytics
-- Don't send data to external services beyond the existing API calls (Anthropic, Fish Audio)
+- Don't send data to external services beyond the existing API calls (OpenRouter, Fish Audio)
 - Don't add features that modify or delete user data in connected services (Mail, Calendar, Notes)
 - Don't break the existing voice loop
 
