@@ -18,7 +18,9 @@ from urllib.parse import quote
 
 log = logging.getLogger("jarvis.actions")
 
-DESKTOP_PATH = Path.home() / "Desktop"
+_projects_env = os.getenv("JARVIS_PROJECTS_DIR", "").strip()
+PROJECTS_PATH = Path(_projects_env).expanduser() if _projects_env else (Path.home() / "JarvisProjects")
+PROJECTS_PATH.mkdir(parents=True, exist_ok=True)
 
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
 
@@ -479,9 +481,9 @@ async def execute_action(intent: dict, projects: list = None) -> dict:
         return result
 
     elif action == "build":
-        # Create project folder on Desktop, spawn Claude Code
+        # Create project folder, spawn Claude Code
         project_name = _generate_project_name(target)
-        project_dir = str(DESKTOP_PATH / project_name)
+        project_dir = str(PROJECTS_PATH / project_name)
         os.makedirs(project_dir, exist_ok=True)
         result = await open_claude_in_project(project_dir, target)
         result["project_dir"] = project_dir

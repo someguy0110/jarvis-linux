@@ -60,6 +60,9 @@ async function apiGet<T>(url: string): Promise<T> {
   const res = await fetch(url, {
     headers: token ? { Authorization: `Bearer ${token}` } : undefined,
   });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
   return res.json();
 }
 
@@ -73,6 +76,9 @@ async function apiPost<T>(url: string, body: unknown): Promise<T> {
     },
     body: JSON.stringify(body),
   });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
   return res.json();
 }
 
@@ -257,6 +263,12 @@ async function loadStatus() {
   } catch (e) {
     console.error("[settings] failed to load status:", e);
     setDotStatus("status-server", "red");
+    const serverDetail = document.getElementById("status-server-detail");
+    if (serverDetail) {
+      const msg = String(e);
+      if (msg.includes("401")) serverDetail.textContent = "unauthorized — set Access Token";
+      else serverDetail.textContent = "offline";
+    }
     return null;
   }
 }

@@ -1,0 +1,15 @@
+[Unit]
+Description=JARVIS Voice Assistant (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/jarvis
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/jarvis/.venv/bin/python %h/jarvis/server.py --host 127.0.0.1 --port 8340 --ssl
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

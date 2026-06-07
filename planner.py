@@ -11,6 +11,7 @@ Handles:
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -21,7 +22,9 @@ from templates import TEMPLATES, get_template
 
 log = logging.getLogger("jarvis.planner")
 
-DESKTOP_PATH = Path.home() / "Desktop"
+_projects_env = os.getenv("JARVIS_PROJECTS_DIR", "").strip()
+PROJECTS_PATH = Path(_projects_env).expanduser() if _projects_env else (Path.home() / "JarvisProjects")
+PROJECTS_PATH.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Planning Mode Detection
@@ -36,7 +39,7 @@ BYPASS_PHRASES = [
 SMART_DEFAULTS = {
     "build": {
         "tech_stack": "React + Tailwind",
-        "project_dir": str(DESKTOP_PATH),
+        "project_dir": str(PROJECTS_PATH),
         "design": "Modern, clean aesthetic",
     },
     "fix": {
@@ -507,7 +510,7 @@ class TaskPlanner:
                         break
                 if not plan.project:
                     plan.project = answer
-                    new_dir = DESKTOP_PATH / answer.lower().replace(" ", "-")
+                    new_dir = PROJECTS_PATH / answer.lower().replace(" ", "-")
                     plan.project_path = str(new_dir)
 
             plan.current_question_index += 1
@@ -604,7 +607,7 @@ class TaskPlanner:
 
         # Where
         if plan.project:
-            target_path = plan.project_path or f"~/Desktop/{plan.project}"
+            target_path = plan.project_path or str(PROJECTS_PATH / plan.project)
             parts.append(f"at {target_path}")
 
         # Tech stack
@@ -632,7 +635,7 @@ class TaskPlanner:
             # Fill template with available data
             fill = {
                 "project_name": plan.project or "project",
-                "working_dir": plan.project_path or str(DESKTOP_PATH),
+                "working_dir": plan.project_path or str(PROJECTS_PATH),
                 "tech_stack": plan.answers.get("tech_stack", "developer's choice"),
                 "sections": plan.answers.get("details", plan.original_request),
                 "design_notes": plan.answers.get("design", "Modern, clean aesthetic"),
@@ -665,7 +668,7 @@ class TaskPlanner:
         """Get the working directory for the current plan."""
         if self.active_plan and self.active_plan.project_path:
             return self.active_plan.project_path
-        return str(DESKTOP_PATH)
+        return str(PROJECTS_PATH)
 
     def reset(self):
         """Clear the active plan."""

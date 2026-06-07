@@ -86,6 +86,26 @@ xdg-open http://localhost:5173  # Linux (or just paste into your browser)
 
 Click the page once to enable audio, then speak. JARVIS will respond.
 
+## Running as a Linux service (systemd)
+
+An example `systemd --user` service file is included here:
+
+- `docs/systemd/jarvis.service`
+
+Typical setup:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+
+mkdir -p ~/.config/systemd/user
+cp docs/systemd/jarvis.service ~/.config/systemd/user/jarvis.service
+systemctl --user daemon-reload
+systemctl --user enable --now jarvis
+journalctl --user -u jarvis -f
+```
+
 ## Configuration
 
 Edit your `.env` file:

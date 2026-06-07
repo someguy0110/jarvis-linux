@@ -4,7 +4,7 @@ JARVIS Server — Voice AI + Development Orchestration
 Handles:
 1. WebSocket voice interface (browser audio <-> LLM <-> TTS)
 2. Claude Code task manager (spawn/manage claude -p subprocesses)
-3. Project awareness (scan Desktop for git repos)
+3. Project awareness (scan projects directory for git repos)
 4. REST API for task management
 """
 
@@ -69,8 +69,6 @@ FISH_API_URL = "https://api.fish.audio/v1/tts"
 USER_NAME = os.getenv("USER_NAME", "sir")
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SKIP_PERMISSIONS = os.getenv("JARVIS_SKIP_PERMISSIONS", "true").lower() not in ("0", "false", "no")
-
-DESKTOP_PATH = Path.home() / "Desktop"
 
 def _ensure_auth_token_env() -> str:
     token = os.getenv("JARVIS_AUTH_TOKEN", "").strip()
@@ -200,16 +198,16 @@ SELF-AWARENESS:
 You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, Anthropic API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
 
 YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT NOW):
-- You CAN open Terminal.app via AppleScript
+- You CAN open a terminal on Linux (when a desktop session is available)
 - You CAN open Google Chrome and browse any URL or search query
 - You CAN spawn Claude Code in a Terminal window for coding tasks
-- You CAN create project folders on the Desktop
-- You CAN check Desktop projects and their git status
+- You CAN create project folders in the projects directory
+- You CAN check projects and their git status
 - You CAN plan complex tasks by asking smart questions before executing
 - You CAN see what's on {user_name}'s screen — open windows, active apps, and screenshot vision
 - You CAN read {user_name}'s calendar — today's events, upcoming meetings, schedule overview
 - You CAN read {user_name}'s email (READ-ONLY) — unread count, recent messages, search by sender/subject. You CANNOT send, delete, or modify emails.
-- You CAN read Apple Notes and create NEW notes — but you CANNOT edit or delete existing notes
+- You CAN read notes and create NEW notes — but you CANNOT edit or delete existing notes
 - You CAN manage tasks — create, complete, and list to-do items with priorities and due dates
 - You CAN help plan {user_name}'s day — combine calendar events, tasks, and priorities into an organized plan
 - You CAN remember facts about {user_name} — preferences, decisions, goals. Use [ACTION:REMEMBER] to store important info.
@@ -767,15 +765,15 @@ class ClaudeTaskManager:
 # ---------------------------------------------------------------------------
 
 async def scan_projects() -> list[dict]:
-    """Quick scan of ~/Desktop for git repos (depth 1)."""
+    """Quick scan of the projects directory for git repos (depth 1)."""
     projects = []
-    desktop = DESKTOP_PATH
+    root = JARVIS_PROJECTS_DIR
 
-    if not desktop.exists():
+    if not root.exists():
         return projects
 
     try:
-        for entry in sorted(desktop.iterdir()):
+        for entry in sorted(root.iterdir()):
             if not entry.is_dir() or entry.name.startswith("."):
                 continue
             git_dir = entry / ".git"
@@ -802,7 +800,7 @@ async def scan_projects() -> list[dict]:
 
 def format_projects_for_prompt(projects: list[dict]) -> str:
     if not projects:
-        return "No projects found on Desktop."
+        return "No projects found."
     lines = []
     for p in projects:
         lines.append(f"- {p['name']} ({p['branch']}) @ {p['path']}")
@@ -976,7 +974,7 @@ async def _execute_research(target: str, ws=None):
     """Execute research via claude -p in background. Opens report and speaks when done."""
     try:
         name = _generate_project_name(target)
-        path = str(Path.home() / "Desktop" / name)
+        path = str(JARVIS_PROJECTS_DIR / name)
         os.makedirs(path, exist_ok=True)
 
         prompt = (
@@ -1082,14 +1080,16 @@ async def _execute_open_terminal():
 
 
 def _find_project_dir(project_name: str) -> str | None:
-    """Find a project directory by name from cached projects or Desktop."""
+    """Find a project directory by name from cached projects."""
     for p in cached_projects:
         if project_name.lower() in p.get("name", "").lower():
             return p.get("path")
-    desktop = Path.home() / "Desktop"
-    for d in desktop.iterdir():
-        if d.is_dir() and project_name.lower() in d.name.lower():
-            return str(d)
+    try:
+        for d in JARVIS_PROJECTS_DIR.iterdir():
+            if d.is_dir() and project_name.lower() in d.name.lower():
+                return str(d)
+    except Exception:
+        pass
     return None
 
 
@@ -1562,9 +1562,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+_rate_state: dict[str, list[float]] = {}
+
+
+def _rate_check(key: str, limit: int, window_seconds: int = 60) -> bool:
+    """Return True if rate-limited."""
+    now = time.time()
+    bucket = _rate_state.get(key, [])
+    cutoff = now - window_seconds
+    bucket = [t for t in bucket if t >= cutoff]
+    if len(bucket) >= limit:
+        _rate_state[key] = bucket
+        return True
+    bucket.append(now)
+    _rate_state[key] = bucket
+    return False
+
+
 @app.middleware("http")
 async def _auth_middleware(request: Request, call_next):
     if request.url.path.startswith("/api") and request.url.path != "/api/health":
+        client_ip = request.client.host if request.client else "unknown"
+        path = request.url.path
+
+        # Basic rate limiting (best-effort, in-memory)
+        # - Settings endpoints: stricter
+        # - Task endpoints: moderate
+        # - Everything else: loose
+        if path.startswith("/api/settings/"):
+            if _rate_check(f"{client_ip}:settings", limit=20):
+                return JSONResponse(status_code=429, content={"error": "rate_limited"})
+        elif path.startswith("/api/tasks"):
+            if _rate_check(f"{client_ip}:tasks", limit=30):
+                return JSONResponse(status_code=429, content={"error": "rate_limited"})
+        else:
+            if _rate_check(f"{client_ip}:api", limit=120):
+                return JSONResponse(status_code=429, content={"error": "rate_limited"})
+
         if not _is_authorized_http(request):
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
         if request.url.path in ("/api/restart", "/api/fix-self") and not JARVIS_DEV_MODE:
@@ -1670,11 +1704,11 @@ async def api_list_projects():
 # -- Fast Action Detection (no LLM call) -----------------------------------
 
 def _scan_projects_sync() -> list[dict]:
-    """Synchronous Desktop scan — runs in executor."""
+    """Synchronous scan — runs in executor."""
     projects = []
-    desktop = Path.home() / "Desktop"
+    root = JARVIS_PROJECTS_DIR
     try:
-        for entry in desktop.iterdir():
+        for entry in root.iterdir():
             if entry.is_dir() and not entry.name.startswith("."):
                 projects.append({"name": entry.name, "path": str(entry), "branch": ""})
     except Exception:
@@ -2232,7 +2266,7 @@ async def voice_handler(ws: WebSocket):
                                     plan.answers[q["key"]] = q["default"]
                         prompt = await planner.build_prompt()
                         name = _generate_project_name(prompt)
-                        path = str(Path.home() / "Desktop" / name)
+                        path = str(JARVIS_PROJECTS_DIR / name)
                         os.makedirs(path, exist_ok=True)
                         Path(path, "CLAUDE.md").write_text(prompt)
                         did = dispatch_registry.register(name, path, prompt[:200])
@@ -2245,7 +2279,7 @@ async def voice_handler(ws: WebSocket):
                         if result["confirmed"]:
                             prompt = await planner.build_prompt()
                             name = _generate_project_name(prompt)
-                            path = str(Path.home() / "Desktop" / name)
+                            path = str(JARVIS_PROJECTS_DIR / name)
                             os.makedirs(path, exist_ok=True)
                             Path(path, "CLAUDE.md").write_text(prompt)
                             did = dispatch_registry.register(name, path, prompt[:200])
@@ -2408,7 +2442,7 @@ async def voice_handler(ws: WebSocket):
                                     # Build in background — JARVIS stays conversational
                                     target = embedded_action["target"]
                                     name = _generate_project_name(target)
-                                    path = str(Path.home() / "Desktop" / name)
+                                    path = str(JARVIS_PROJECTS_DIR / name)
                                     os.makedirs(path, exist_ok=True)
 
                                     # Write detailed CLAUDE.md
@@ -2437,7 +2471,7 @@ async def voice_handler(ws: WebSocket):
                                 elif embedded_action["action"] == "research":
                                     # Research enters work mode too
                                     name = _generate_project_name(embedded_action["target"])
-                                    path = str(Path.home() / "Desktop" / name)
+                                    path = str(JARVIS_PROJECTS_DIR / name)
                                     os.makedirs(path, exist_ok=True)
                                     await work_session.start(path)
                                     asyncio.create_task(

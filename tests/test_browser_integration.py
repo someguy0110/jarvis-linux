@@ -31,6 +31,27 @@ def _has_network() -> bool:
 
 
 NETWORK_AVAILABLE = _has_network()
+
+
+def _has_playwright_browsers() -> bool:
+    """Best-effort check for Playwright browser binaries."""
+    path = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if path:
+        root = Path(path).expanduser()
+    else:
+        root = Path.home() / ".cache" / "ms-playwright"
+    if not root.exists():
+        return False
+    try:
+        for entry in root.iterdir():
+            if entry.is_dir() and entry.name.startswith(("chromium", "firefox", "webkit")):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+PLAYWRIGHT_BROWSERS_AVAILABLE = _has_playwright_browsers()
 SKIP_REASON = "No network or Playwright browsers not available"
 
 
@@ -46,7 +67,7 @@ async def browser():
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
+@pytest.mark.skipif((not NETWORK_AVAILABLE) or (not PLAYWRIGHT_BROWSERS_AVAILABLE), reason=SKIP_REASON)
 async def test_browser_search(browser):
     """Search returns results from DuckDuckGo (may be empty if DDG blocks)."""
     results = await browser.search("Python FastAPI documentation")
@@ -64,7 +85,7 @@ async def test_browser_search(browser):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
+@pytest.mark.skipif((not NETWORK_AVAILABLE) or (not PLAYWRIGHT_BROWSERS_AVAILABLE), reason=SKIP_REASON)
 async def test_browser_search_empty_query(browser):
     """Search handles empty query gracefully."""
     results = await browser.search("")
@@ -75,7 +96,7 @@ async def test_browser_search_empty_query(browser):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
+@pytest.mark.skipif((not NETWORK_AVAILABLE) or (not PLAYWRIGHT_BROWSERS_AVAILABLE), reason=SKIP_REASON)
 async def test_browser_visit(browser):
     """Visit extracts readable content from a known page."""
     content = await browser.visit("https://example.com")
@@ -90,7 +111,7 @@ async def test_browser_visit(browser):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
+@pytest.mark.skipif((not NETWORK_AVAILABLE) or (not PLAYWRIGHT_BROWSERS_AVAILABLE), reason=SKIP_REASON)
 async def test_browser_visit_invalid_url(browser):
     """Visit handles invalid URLs gracefully."""
     content = await browser.visit("https://this-domain-definitely-does-not-exist-12345.com")
@@ -103,7 +124,7 @@ async def test_browser_visit_invalid_url(browser):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
+@pytest.mark.skipif((not NETWORK_AVAILABLE) or (not PLAYWRIGHT_BROWSERS_AVAILABLE), reason=SKIP_REASON)
 async def test_browser_screenshot(browser):
     """Screenshot produces a valid PNG file."""
     tmp_path = tempfile.mktemp(suffix=".png", prefix="jarvis_test_ss_")
@@ -129,7 +150,7 @@ async def test_browser_screenshot(browser):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
+@pytest.mark.skipif((not NETWORK_AVAILABLE) or (not PLAYWRIGHT_BROWSERS_AVAILABLE), reason=SKIP_REASON)
 async def test_browser_screenshot_default_path(browser):
     """Screenshot with no path generates a temp file."""
     result_path = await browser.screenshot("https://example.com")
@@ -147,7 +168,7 @@ async def test_browser_screenshot_default_path(browser):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skipif(not NETWORK_AVAILABLE, reason=SKIP_REASON)
+@pytest.mark.skipif((not NETWORK_AVAILABLE) or (not PLAYWRIGHT_BROWSERS_AVAILABLE), reason=SKIP_REASON)
 async def test_browser_research(browser):
     """Research performs multi-step search and visit."""
     result = await browser.research("Python FastAPI tutorial")
