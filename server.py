@@ -34,13 +34,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import anthropic
 import httpx
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from llm_client import OpenRouterClient, load_openrouter_client
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
@@ -62,7 +62,7 @@ log = logging.getLogger("jarvis")
 # Config
 # ---------------------------------------------------------------------------
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 FISH_API_KEY = os.getenv("FISH_API_KEY", "")
 FISH_VOICE_ID = os.getenv("FISH_VOICE_ID", "612b878b113047d9a770c069c8b4fdfe")  # JARVIS (MCU)
 FISH_API_URL = "https://api.fish.audio/v1/tts"
@@ -837,16 +837,17 @@ def apply_speech_corrections(text: str) -> str:
 # LLM Intent Classifier (replaces keyword-based action detection)
 # ---------------------------------------------------------------------------
 
-async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
+async def classify_intent(text: str, client: OpenRouterClient) -> dict:
     """Classify every user message using Haiku LLM.
 
     Returns: {"action": "open_terminal|browse|build|chat", "target": "description"}
     """
     try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        data = await client.chat_raw(
+            model=client.fast_model,
             max_tokens=100,
-            system=(
+            messages=[
+                {"role": "system", "content": (
                 "Classify this voice command. The user is talking to JARVIS, an AI assistant that can:\n"
                 "- Open Terminal and run Claude Code (coding AI tool)\n"
                 "- Open Chrome browser for web searches and URLs\n"
@@ -861,10 +862,13 @@ async def classify_intent(text: str, client: anthropic.AsyncAnthropic) -> dict:
                 "build = user wants to create/build a software project\n"
                 "chat = just conversation, questions, or anything else\n"
                 "If unclear, default to \"chat\"."
-            ),
-            messages=[{"role": "user", "content": text}],
+                )},
+                {"role": "user", "content": text},
+            ],
         )
-        raw = response.content[0].text.strip()
+        track_usage(data)
+        raw = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
+        raw = raw.strip()
         if raw.startswith("```"):
             raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
         data = json.loads(raw)
@@ -1151,12 +1155,13 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
             msg = f"Sir, I ran into an issue with {project_name}. {full_response[:150] if full_response else 'No response received.'}"
         else:
             # Summarize via Haiku — don't read word for word
-            if anthropic_client:
+            if llm_client and llm_client.configured:
                 try:
-                    summary = await anthropic_client.messages.create(
-                        model="claude-haiku-4-5-20251001",
+                    data = await llm_client.chat_raw(
+                        model=llm_client.fast_model,
                         max_tokens=150,
-                        system=(
+                        messages=[
+                            {"role": "system", "content": (
                             "You are JARVIS reporting back on what you found or built in a project. "
                             "Speak in first person — 'I found', 'I built', 'I reviewed'. "
                             "Start with 'Sir, ' to get the user's attention. "
@@ -1165,10 +1170,12 @@ async def _execute_prompt_project(project_name: str, prompt: str, work_session: 
                             "End by asking how the user wants to proceed. "
                             "NEVER read out URLs or localhost addresses. NEVER say 'Claude Code'. "
                             "2-3 sentences max. No markdown. Natural spoken voice."
-                        ),
-                        messages=[{"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"}],
+                            )},
+                            {"role": "user", "content": f"Project: {project_name}\nClaude Code reported:\n{full_response[:3000]}"},
+                        ],
                     )
-                    msg = summary.content[0].text
+                    track_usage(data)
+                    msg = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
                 except Exception:
                     msg = f"Sir, {project_name} finished. Here's the gist: {full_response[:200]}"
             else:
@@ -1219,15 +1226,18 @@ async def self_work_and_notify(session: WorkSession, prompt: str, ws):
         log.info(f"Background work complete ({len(full_response)} chars)")
 
         # Summarize and speak
-        if anthropic_client and full_response:
+        if llm_client and llm_client.configured and full_response:
             try:
-                summary = await anthropic_client.messages.create(
-                    model="claude-haiku-4-5-20251001",
+                data = await llm_client.chat_raw(
+                    model=llm_client.fast_model,
                     max_tokens=100,
-                    system="You are JARVIS. Summarize what you just completed in 1 sentence. First person — 'I built', 'I set up'. No markdown. Never say 'Claude Code'.",
-                    messages=[{"role": "user", "content": f"Claude Code completed:\n{full_response[:2000]}"}],
+                    messages=[
+                        {"role": "system", "content": "You are JARVIS. Summarize what you just completed in 1 sentence. First person — 'I built', 'I set up'. No markdown. Never say 'Claude Code'."},
+                        {"role": "user", "content": f"Claude Code completed:\n{full_response[:2000]}"},
+                    ],
                 )
-                msg = summary.content[0].text
+                track_usage(data)
+                msg = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
             except Exception:
                 msg = "Work is complete, sir."
 
@@ -1348,14 +1358,13 @@ async def generate_response(
         messages = messages + [{"role": "user", "content": text}]
 
     try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=250,  # Extra room for [ACTION:X] tags
-            system=system,
-            messages=messages,
+        data = await client.chat_raw(
+            model=client.fast_model,
+            max_tokens=250,
+            messages=[{"role": "system", "content": system}] + messages,
         )
-        track_usage(response)
-        return response.content[0].text
+        track_usage(data)
+        return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
     except Exception as e:
         log.error(f"LLM error: {e}")
         return "Apologies, sir. I'm having trouble connecting to my language systems."
@@ -1367,7 +1376,7 @@ async def generate_response(
 
 # Shared state
 task_manager = ClaudeTaskManager(max_concurrent=3)
-anthropic_client: Optional[anthropic.AsyncAnthropic] = None
+llm_client: Optional[OpenRouterClient] = None
 cached_projects: list[dict] = []
 recently_built: list[dict] = []  # [{"name": str, "path": str, "time": float}]
 dispatch_registry = DispatchRegistry()
@@ -1424,9 +1433,9 @@ def _cost_from_tokens(input_t: int, output_t: int) -> float:
 
 
 def track_usage(response):
-    """Track token usage from an Anthropic API response."""
-    inp = getattr(response.usage, "input_tokens", 0) if hasattr(response, "usage") else 0
-    out = getattr(response.usage, "output_tokens", 0) if hasattr(response, "usage") else 0
+    usage = (response or {}).get("usage") or {}
+    inp = int(usage.get("prompt_tokens") or 0)
+    out = int(usage.get("completion_tokens") or 0)
     _session_tokens["input"] += inp
     _session_tokens["output"] += out
     _session_tokens["api_calls"] += 1
@@ -1538,11 +1547,10 @@ return windowList
 
 @asynccontextmanager
 async def lifespan(application: FastAPI):
-    global anthropic_client, cached_projects
-    if ANTHROPIC_API_KEY:
-        anthropic_client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
-    else:
-        log.warning("ANTHROPIC_API_KEY not set — LLM features disabled")
+    global llm_client, cached_projects
+    llm_client = load_openrouter_client()
+    if not llm_client.configured:
+        log.warning("OPENROUTER_API_KEY not set — LLM features disabled")
     cached_projects = []
 
     # Start context refresh in a separate thread (never touches event loop)
@@ -1943,8 +1951,8 @@ async def _do_mail_lookup() -> str:
 
 async def _do_screen_lookup() -> str:
     """Screen describe — runs in thread."""
-    if anthropic_client:
-        return await describe_screen(anthropic_client)
+    if llm_client and llm_client.configured:
+        return await describe_screen(llm_client)
     windows = await get_active_windows()
     if windows:
         apps = set(w["app"] for w in windows)
