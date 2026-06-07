@@ -279,44 +279,39 @@ async def _take_screenshot_linux() -> str | None:
             pass
 
 
-async def describe_screen(anthropic_client) -> str:
+async def describe_screen(client) -> str:
     """Describe what's on the user's screen.
 
     Tries screenshot + vision first. Falls back to window list + LLM summary.
     """
     # Try screenshot + vision
     screenshot_b64 = await take_screenshot()
-    if screenshot_b64 and anthropic_client:
+    if screenshot_b64 and client:
         try:
-            response = await anthropic_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+            data = await client.chat_raw(
+                model=client.vision_model,
                 max_tokens=300,
-                system=(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
                     "You are JARVIS analyzing a screenshot of the user's desktop. "
                     "Describe what you see concisely: which apps are open, what the user "
                     "appears to be working on, any notable content visible. "
                     "Be specific about app names, file names, URLs, code, or documents visible. "
                     "2-4 sentences max. No markdown."
-                ),
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": screenshot_b64,
-                            },
-                        },
-                        {
-                            "type": "text",
-                            "text": "What's on my screen right now?",
-                        },
-                    ],
-                }],
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What's on my screen right now?"},
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{screenshot_b64}"}},
+                        ],
+                    },
+                ],
             )
-            return response.content[0].text
+            return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
         except Exception as e:
             log.warning(f"Vision call failed, falling back to window list: {e}")
 
@@ -340,18 +335,23 @@ async def describe_screen(anthropic_client) -> str:
         if bg_apps:
             context_parts.append(f"Background apps: {', '.join(bg_apps)}")
 
-    if anthropic_client and context_parts:
+    if client and context_parts:
         try:
-            response = await anthropic_client.messages.create(
-                model="claude-haiku-4-5-20251001",
+            data = await client.chat_raw(
+                model=client.fast_model,
                 max_tokens=100,
-                system=(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
                     "You are JARVIS. Given the user's open windows and apps, summarize "
                     "what they appear to be working on in 1-2 sentences. Natural voice, no markdown."
-                ),
-                messages=[{"role": "user", "content": "Open windows:\n" + "\n".join(context_parts)}],
+                        ),
+                    },
+                    {"role": "user", "content": "Open windows:\n" + "\n".join(context_parts)},
+                ],
             )
-            return response.content[0].text
+            return ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
         except Exception:
             pass
 

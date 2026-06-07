@@ -35,7 +35,7 @@ JARVIS can browse the web, spawn Claude Code sessions to build entire projects, 
 - **Python 3.11+**
 - **Node.js 18+**
 - **Google Chrome** (required for Web Speech API)
-- **Anthropic API key** -- powers the AI brain ([get one here](https://console.anthropic.com/))
+- **OpenRouter API key** -- powers the LLM brain ([get one here](https://openrouter.ai/keys))
 - **Fish Audio API key** -- powers the voice ([get one here](https://fish.audio/))
 - **Claude Code CLI** -- for spawning dev tasks ([install here](https://docs.anthropic.com/en/docs/claude-code))
 
@@ -112,7 +112,7 @@ Edit your `.env` file:
 
 ```env
 # Required
-ANTHROPIC_API_KEY=your-anthropic-api-key-here
+OPENROUTER_API_KEY=your-openrouter-api-key-here
 FISH_API_KEY=your-fish-audio-api-key-here
 
 # Optional -- your name (JARVIS will address you personally)
@@ -126,7 +126,7 @@ CALENDAR_ACCOUNTS=you@gmail.com,work@company.com
 ## Architecture
 
 ```
-Microphone -> Web Speech API -> WebSocket -> FastAPI -> Claude (Haiku) -> Fish Audio TTS -> WebSocket -> Speaker
+Microphone -> Web Speech API -> WebSocket -> FastAPI -> LLM (via OpenRouter) -> Fish Audio TTS -> WebSocket -> Speaker
                                                 |
                                                 v
                                         Claude Code Tasks
@@ -213,7 +213,7 @@ Free for personal, non-commercial use. Commercial use requires a license — vis
 
 Built by [Ethan](https://ethanplus.ai).
 
-Powered by [Anthropic Claude](https://anthropic.com) and [Fish Audio](https://fish.audio).
+Powered by [OpenRouter](https://openrouter.ai) (LLM routing) and [Fish Audio](https://fish.audio).
 
 Inspired by the AI that started it all -- Tony Stark's JARVIS.
 

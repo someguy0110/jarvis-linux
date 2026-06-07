@@ -40,7 +40,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from llm_client import OpenRouterClient, load_openrouter_client
+from llm_client import OpenRouterClient, OpenRouterConfig, load_openrouter_client
 from actions import execute_action, monitor_build, open_terminal, open_browser, open_claude_in_project, _generate_project_name, prompt_existing_terminal, applescript_escape
 from work_mode import WorkSession, is_casual_question
 from screen import get_active_windows, take_screenshot, describe_screen, format_windows_for_context
@@ -195,7 +195,7 @@ CONVERSATION STYLE:
 - When you don't know something: "I'm afraid I don't have that information, sir" not "I don't know"
 
 SELF-AWARENESS:
-You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, Anthropic API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
+You ARE the JARVIS project at {project_dir} on {user_name}'s computer. Your code is Python (FastAPI server, WebSocket voice, Fish Audio TTS, OpenRouter LLM API). You were built by {user_name}. If asked about yourself, your code, how you work, or your line count — use [ACTION:PROMPT_PROJECT] to check the jarvis project. You have full access to your own source code.
 
 YOUR CAPABILITIES (these are REAL and ACTIVE — you CAN do all of these RIGHT NOW):
 - You CAN open a terminal on Linux (when a desktop session is available)
@@ -238,7 +238,7 @@ If the user asks you to do something you genuinely can't do, say "I'm afraid tha
 YOUR INTERFACE:
 The user interacts with you through a web browser showing a particle orb visualization that reacts to your voice. The interface has these controls:
 - **Three-dot menu** (top right): contains Settings, Restart Server, and Fix Yourself options
-- **Settings panel**: Opens from the menu. Users can enter API keys (Anthropic, Fish Audio), test connections, set their name and preferences, and see system status (calendar, mail, notes connectivity). Keys are saved to the .env file.
+- **Settings panel**: Opens from the menu. Users can enter API keys (OpenRouter, Fish Audio), test connections, set their name and preferences, and see system status (calendar, mail, notes connectivity). Keys are saved to the .env file.
 - **Mute button**: Toggles your listening on/off. When muted, you can't hear the user. They click it again to unmute.
 - **Restart Server**: Restarts your backend process. Useful if something seems stuck.
 - **Fix Yourself**: Opens Claude Code in your own project directory so you can debug and fix issues in your own code.
@@ -1300,14 +1300,14 @@ async def synthesize_speech(text: str) -> Optional[bytes]:
 
 async def generate_response(
     text: str,
-    client: anthropic.AsyncAnthropic,
+    client: OpenRouterClient,
     task_mgr: ClaudeTaskManager,
     projects: list[dict],
     conversation_history: list[dict],
     last_response: str = "",
     session_summary: str = "",
 ) -> str:
-    """Generate a JARVIS response using Anthropic API."""
+    """Generate a JARVIS response using OpenRouter."""
     now = datetime.now()
     current_time = now.strftime("%A, %B %d, %Y at %I:%M %p")
 
@@ -2038,16 +2038,22 @@ async def handle_browse(text: str, target: str) -> str:
     return "Searching for that, sir."
 
 
-async def handle_research(text: str, target: str, client: anthropic.AsyncAnthropic) -> str:
+async def handle_research(text: str, target: str, client: OpenRouterClient) -> str:
     """Deep research with Opus — write results to HTML, open in browser."""
     try:
-        research_response = await client.messages.create(
-            model="claude-opus-4-6",
+        research_data = await client.chat_raw(
+            model=client.research_model,
             max_tokens=2000,
-            system=f"You are JARVIS, researching a topic for {USER_NAME}. Be thorough, organized, and cite sources where possible.",
-            messages=[{"role": "user", "content": f"Research this thoroughly:\n\n{target}"}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are JARVIS, researching a topic for {USER_NAME}. Be thorough, organized, and cite sources where possible.",
+                },
+                {"role": "user", "content": f"Research this thoroughly:\n\n{target}"},
+            ],
         )
-        research_text = research_response.content[0].text
+        track_usage(research_data)
+        research_text = ((research_data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
 
         import html as _html
         html_content = f"""<!DOCTYPE html>
@@ -2076,14 +2082,18 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
         browser_name = "firefox" if "firefox" in text.lower() else "chrome"
         await open_browser(f"file://{results_file}", browser_name)
 
-        # Short voice summary via Haiku
-        summary = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        # Short voice summary (fast model)
+        summary_data = await client.chat_raw(
+            model=client.fast_model,
             max_tokens=80,
-            system="Summarize this research in ONE sentence for voice. No markdown.",
-            messages=[{"role": "user", "content": research_text[:2000]}],
+            messages=[
+                {"role": "system", "content": "Summarize this research in ONE sentence for voice. No markdown."},
+                {"role": "user", "content": research_text[:2000]},
+            ],
         )
-        return summary.content[0].text + " Full results are in your browser, sir."
+        track_usage(summary_data)
+        summary_text = ((summary_data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
+        return (summary_text or "Done, sir.") + " Full results are in your browser, sir."
 
     except Exception as e:
         log.error(f"Research failed: {e}")
@@ -2097,7 +2107,7 @@ blockquote {{ border-left: 3px solid #0ea5e9; margin-left: 0; padding-left: 16px
 async def _update_session_summary(
     old_summary: str,
     rotated_messages: list[dict],
-    client: anthropic.AsyncAnthropic,
+    client: OpenRouterClient,
 ) -> str:
     """Background Haiku call to update the rolling session summary."""
     prompt = f"""Update this conversation summary to include the new messages.
@@ -2110,12 +2120,14 @@ New messages to incorporate:
 Write an updated summary in 2-4 sentences capturing the key topics, decisions, and context. Be concise."""
 
     try:
-        response = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+        data = await client.chat_raw(
+            model=client.fast_model,
             max_tokens=200,
             messages=[{"role": "user", "content": prompt}],
         )
-        return response.content[0].text.strip()
+        track_usage(data)
+        text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
+        return text.strip()
     except Exception as e:
         log.warning(f"Summary update failed: {e}")
         return old_summary  # Keep old summary on failure
@@ -2233,6 +2245,8 @@ async def voice_handler(ws: WebSocket):
             if not user_text:
                 continue
 
+            client = llm_client if (llm_client and llm_client.configured) else None
+
             # Cancel any in-flight response
             _current_response_id += 1
             my_response_id = _current_response_id
@@ -2318,7 +2332,7 @@ async def voice_handler(ws: WebSocket):
                     if is_casual_question(user_text):
                         # Quick chat — bypass claude -p, use Haiku
                         response_text = await generate_response(
-                            user_text, anthropic_client, task_manager,
+                            user_text, client, task_manager,
                             cached_projects, history,
                             last_response=last_jarvis_response,
                             session_summary=session_summary,
@@ -2331,7 +2345,7 @@ async def voice_handler(ws: WebSocket):
                         full_response = await work_session.send(user_text)
 
                         # Detect if Claude Code is stalling (asking questions instead of building)
-                        if full_response and anthropic_client:
+                        if full_response and client:
                             stall_words = ["which option", "would you prefer", "would you like me to",
                                            "before I proceed", "before proceeding", "should I",
                                            "do you want me to", "let me know", "please confirm",
@@ -2355,22 +2369,28 @@ async def voice_handler(ws: WebSocket):
                             log.info(f"Auto-opening {localhost_match.group(0)}")
 
                         # Always summarize work mode responses via Haiku
-                        if full_response and anthropic_client:
+                        if full_response and client:
                             try:
-                                summary = await anthropic_client.messages.create(
-                                    model="claude-haiku-4-5-20251001",
+                                summary_data = await client.chat_raw(
+                                    model=client.fast_model,
                                     max_tokens=100,
-                                    system=(
+                                    messages=[
+                                        {
+                                            "role": "system",
+                                            "content": (
                                         f"You are JARVIS reporting to the user ({USER_NAME}). Summarize what happened in 1-2 sentences. "
                                         "Speak in first person — 'I built', 'I found', 'I set up'. "
                                         "You are talking TO THE USER, not to a coding tool. "
                                         "NEVER give instructions like 'go ahead and build' or 'set up the frontend' — those are NOT for the user. "
                                         "NEVER say 'Claude Code'. NEVER output [ACTION:...] tags. "
                                         "NEVER read out URLs. No markdown. British precision."
-                                    ),
-                                    messages=[{"role": "user", "content": f"Claude Code said:\n{full_response[:2000]}"}],
+                                            ),
+                                        },
+                                        {"role": "user", "content": f"Claude Code said:\n{full_response[:2000]}"},
+                                    ],
                                 )
-                                response_text = summary.content[0].text
+                                track_usage(summary_data)
+                                response_text = ((summary_data.get("choices") or [{}])[0].get("message") or {}).get("content", "") or ""
                             except Exception:
                                 response_text = full_response[:200]
                         else:
@@ -2418,11 +2438,11 @@ async def voice_handler(ws: WebSocket):
                         else:
                             response_text = "Understood, sir."
                     else:
-                        if not anthropic_client:
+                        if not client:
                             response_text = "API key not configured."
                         else:
                             response_text = await generate_response(
-                                user_text, anthropic_client, task_manager,
+                                user_text, client, task_manager,
                                 cached_projects, history,
                                 last_response=last_jarvis_response,
                                 session_summary=session_summary,
@@ -2575,11 +2595,11 @@ async def voice_handler(ws: WebSocket):
                     messages_since_last_summary = 0
                     # Get messages that are about to be rotated out
                     rotated = history[:-20] if len(history) > 20 else []
-                    if rotated and anthropic_client:
+                    if rotated and client:
                         async def _do_summary():
                             nonlocal session_summary, summary_update_pending
                             session_summary = await _update_session_summary(
-                                session_summary, rotated, anthropic_client
+                                session_summary, rotated, client
                             )
                             summary_update_pending = False
                         asyncio.create_task(_do_summary())
@@ -2587,8 +2607,8 @@ async def voice_handler(ws: WebSocket):
                         summary_update_pending = False
 
                 # Extract memories in background (doesn't block response)
-                if anthropic_client and len(user_text) > 15:
-                    asyncio.create_task(extract_memories(user_text, response_text, anthropic_client))
+                if client and len(user_text) > 15:
+                    asyncio.create_task(extract_memories(user_text, response_text, client))
 
                 # TTS
                 tts = strip_markdown_for_tts(response_text)
@@ -2685,20 +2705,45 @@ class PreferencesUpdate(BaseModel):
 
 @app.post("/api/settings/keys")
 async def api_settings_keys(body: KeyUpdate):
-    allowed = {"ANTHROPIC_API_KEY", "FISH_API_KEY", "FISH_VOICE_ID", "USER_NAME", "HONORIFIC", "CALENDAR_ACCOUNTS"}
+    allowed = {
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OPENROUTER_FAST_MODEL",
+        "OPENROUTER_RESEARCH_MODEL",
+        "OPENROUTER_VISION_MODEL",
+        "OPENROUTER_SITE_URL",
+        "OPENROUTER_APP_NAME",
+        "FISH_API_KEY",
+        "FISH_VOICE_ID",
+        "USER_NAME",
+        "HONORIFIC",
+        "CALENDAR_ACCOUNTS",
+    }
     if body.key_name not in allowed:
         return JSONResponse({"success": False, "error": "Invalid key name"}, status_code=400)
     _write_env_key(body.key_name, body.key_value)
+    global llm_client
+    llm_client = load_openrouter_client()
     return {"success": True}
 
-@app.post("/api/settings/test-anthropic")
-async def api_test_anthropic(body: KeyTest):
-    key = body.key_value or os.getenv("ANTHROPIC_API_KEY", "")
+@app.post("/api/settings/test-openrouter")
+async def api_test_openrouter(body: KeyTest):
+    key = body.key_value or os.getenv("OPENROUTER_API_KEY", "")
     if not key:
         return {"valid": False, "error": "No key provided"}
     try:
-        client = anthropic.AsyncAnthropic(api_key=key)
-        await client.messages.create(model="claude-haiku-4-5-20251001", max_tokens=10, messages=[{"role": "user", "content": "Hi"}])
+        client = OpenRouterClient(
+            OpenRouterConfig(
+                api_key=key,
+                base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip(),
+                fast_model=os.getenv("OPENROUTER_FAST_MODEL", "anthropic/claude-3.5-haiku").strip(),
+                research_model=os.getenv("OPENROUTER_RESEARCH_MODEL", "anthropic/claude-3.5-sonnet").strip(),
+                vision_model=os.getenv("OPENROUTER_VISION_MODEL", "anthropic/claude-3.5-sonnet").strip(),
+                site_url=os.getenv("OPENROUTER_SITE_URL", "").strip(),
+                app_name=os.getenv("OPENROUTER_APP_NAME", "JARVIS").strip(),
+            )
+        )
+        await client.chat_raw(model=client.fast_model, max_tokens=10, messages=[{"role": "user", "content": "Hi"}])
         return {"valid": True}
     except Exception:
         return {"valid": False, "error": "Test failed"}
@@ -2751,7 +2796,7 @@ async def api_settings_status():
         "server_port": 8340,
         "uptime_seconds": int(time.time() - _session_start),
         "env_keys_set": {
-            "anthropic": bool(env_dict.get("ANTHROPIC_API_KEY", "").strip() and env_dict.get("ANTHROPIC_API_KEY", "") != "your-anthropic-api-key-here"),
+            "openrouter": bool(env_dict.get("OPENROUTER_API_KEY", "").strip() and env_dict.get("OPENROUTER_API_KEY", "") != "your-openrouter-api-key-here"),
             "fish_audio": bool(env_dict.get("FISH_API_KEY", "").strip() and env_dict.get("FISH_API_KEY", "") != "your-fish-audio-api-key-here"),
             "fish_voice_id": bool(env_dict.get("FISH_VOICE_ID", "").strip()),
             "user_name": env_dict.get("USER_NAME", ""),

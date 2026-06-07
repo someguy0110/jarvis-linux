@@ -19,7 +19,7 @@ interface StatusResponse {
   server_port: number;
   uptime_seconds: number;
   env_keys_set: {
-    anthropic: boolean;
+    openrouter: boolean;
     fish_audio: boolean;
     fish_voice_id: boolean;
     user_name: string;
@@ -39,7 +39,7 @@ interface PreferencesResponse {
 let panelEl: HTMLElement | null = null;
 let isOpen = false;
 let isFirstTimeSetup = false;
-let setupStep = 0; // 0=anthropic, 1=fish, 2=name, 3=done
+let setupStep = 0; // 0=openrouter, 1=fish, 2=name, 3=done
 
 const AUTH_TOKEN_KEY = "jarvis_auth_token";
 
@@ -114,11 +114,11 @@ function buildPanelHTML(): string {
           </div>
 
           <div class="settings-field">
-            <label>Anthropic API Key</label>
+            <label>OpenRouter API Key</label>
             <div class="settings-input-row">
-              <input type="password" id="input-anthropic-key" placeholder="sk-ant-..." />
-              <button class="settings-btn" id="btn-test-anthropic">Test</button>
-              <span class="status-dot" id="status-anthropic"></span>
+              <input type="password" id="input-openrouter-key" placeholder="sk-or-..." />
+              <button class="settings-btn" id="btn-test-openrouter">Test</button>
+              <span class="status-dot" id="status-openrouter"></span>
             </div>
           </div>
 
@@ -149,9 +149,9 @@ function buildPanelHTML(): string {
           <h3>Connection Status</h3>
           <div class="status-grid">
             <div class="status-row"><span class="status-dot" id="status-claude-cli"></span><span>Claude Code CLI</span></div>
-            <div class="status-row"><span class="status-dot" id="status-calendar"></span><span>Apple Calendar</span></div>
-            <div class="status-row"><span class="status-dot" id="status-mail"></span><span>Apple Mail</span></div>
-            <div class="status-row"><span class="status-dot" id="status-notes"></span><span>Apple Notes</span></div>
+            <div class="status-row"><span class="status-dot" id="status-calendar"></span><span>Calendar</span></div>
+            <div class="status-row"><span class="status-dot" id="status-mail"></span><span>Mail</span></div>
+            <div class="status-row"><span class="status-dot" id="status-notes"></span><span>Notes</span></div>
             <div class="status-row"><span class="status-dot" id="status-server"></span><span>Server</span><span class="status-detail" id="status-server-detail"></span></div>
           </div>
         </section>
@@ -246,7 +246,7 @@ async function loadStatus() {
     if (serverDetail) serverDetail.textContent = `port ${status.server_port} | up ${formatUptime(status.uptime_seconds)}`;
 
     // API key status dots
-    setDotStatus("status-anthropic", status.env_keys_set.anthropic ? "green" : "red");
+    setDotStatus("status-openrouter", status.env_keys_set.openrouter ? "green" : "red");
     setDotStatus("status-fish", status.env_keys_set.fish_audio ? "green" : "red");
 
     // System info
@@ -294,11 +294,11 @@ function wireEvents() {
 
   // Save keys
   document.getElementById("btn-save-keys")?.addEventListener("click", async () => {
-    const anthropicKey = (document.getElementById("input-anthropic-key") as HTMLInputElement).value.trim();
+    const openrouterKey = (document.getElementById("input-openrouter-key") as HTMLInputElement).value.trim();
     const fishKey = (document.getElementById("input-fish-key") as HTMLInputElement).value.trim();
 
-    if (anthropicKey) {
-      await apiPost("/api/settings/keys", { key_name: "ANTHROPIC_API_KEY", key_value: anthropicKey });
+    if (openrouterKey) {
+      await apiPost("/api/settings/keys", { key_name: "OPENROUTER_API_KEY", key_value: openrouterKey });
     }
     if (fishKey) {
       await apiPost("/api/settings/keys", { key_name: "FISH_API_KEY", key_value: fishKey });
@@ -324,15 +324,15 @@ function wireEvents() {
     }
   });
 
-  // Test Anthropic
-  document.getElementById("btn-test-anthropic")?.addEventListener("click", async () => {
-    setDotStatus("status-anthropic", "yellow");
-    const key = (document.getElementById("input-anthropic-key") as HTMLInputElement).value.trim();
+  // Test OpenRouter
+  document.getElementById("btn-test-openrouter")?.addEventListener("click", async () => {
+    setDotStatus("status-openrouter", "yellow");
+    const key = (document.getElementById("input-openrouter-key") as HTMLInputElement).value.trim();
     try {
-      const result = await apiPost<{ valid: boolean; error?: string }>("/api/settings/test-anthropic", { key_value: key || undefined });
-      setDotStatus("status-anthropic", result.valid ? "green" : "red");
+      const result = await apiPost<{ valid: boolean; error?: string }>("/api/settings/test-openrouter", { key_value: key || undefined });
+      setDotStatus("status-openrouter", result.valid ? "green" : "red");
     } catch {
-      setDotStatus("status-anthropic", "red");
+      setDotStatus("status-openrouter", "red");
     }
   });
 
@@ -449,7 +449,7 @@ export async function openSettings() {
   await loadPreferences();
 
   // Check for first-time setup
-  if (status && !status.env_keys_set.anthropic) {
+  if (status && !status.env_keys_set.openrouter) {
     enterSetupMode();
   }
 }
@@ -473,7 +473,7 @@ export function isSettingsOpen(): boolean {
 export async function checkFirstTimeSetup(): Promise<boolean> {
   try {
     const status = await apiGet<StatusResponse>("/api/settings/status");
-    if (!status.env_keys_set.anthropic) {
+    if (!status.env_keys_set.openrouter) {
       openSettings();
       return true;
     }
